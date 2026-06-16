@@ -1,0 +1,6 @@
+Checks: 'bugprone-*,cert-*,performance-*,portability-*,modernize-*'
+WarningsAsErrors: ''
+HeaderFilterRegex: 'include/forge/.*'
+CheckOptions:
+  - key: modernize-use-trailing-return-type
+    value: false
