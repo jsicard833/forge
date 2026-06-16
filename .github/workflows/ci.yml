@@ -122,8 +122,16 @@ jobs:
             --target forge_tests forge_vector_benchmarks
 
       - name: Run unit tests
-        env:
-          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:check_initialization_order=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        shell: bash
         run: |
+          set -euo pipefail
+
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            export ASAN_OPTIONS="strict_string_checks=1:check_initialization_order=1"
+          else
+            export ASAN_OPTIONS="detect_leaks=1:strict_string_checks=1:check_initialization_order=1"
+          fi
+
+          export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
+
           ctest --test-dir build --build-config Release --output-on-failure
