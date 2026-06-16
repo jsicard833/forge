@@ -1,0 +1,121 @@
+name: Forge CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu GCC (Release)
+            os: ubuntu-latest
+            compiler: gcc
+            cc: gcc-13
+            cxx: g++-13
+            sanitizer: false
+
+          - name: Ubuntu Clang (Release)
+            os: ubuntu-latest
+            compiler: clang
+            cc: clang-18
+            cxx: clang++-18
+            sanitizer: false
+
+          - name: Ubuntu Clang (ASan+UBSan)
+            os: ubuntu-latest
+            compiler: clang
+            cc: clang-18
+            cxx: clang++-18
+            sanitizer: true
+
+          - name: macOS Apple Clang (Release)
+            os: macos-latest
+            compiler: apple-clang
+            cc: clang
+            cxx: clang++
+            sanitizer: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Ensure CMake >= 3.23 on all runners.
+      - name: Setup CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.29.6'
+
+      - name: Install Linux toolchains
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 clang-18 lld-18 ninja-build
+
+      - name: Validate compiler versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ matrix.cc }}" --version
+          "${{ matrix.cxx }}" --version
+
+          if [[ "${{ matrix.compiler }}" == "gcc" ]]; then
+            major=$("${{ matrix.cxx }}" -dumpversion | cut -d. -f1)
+            if (( major < 13 )); then
+              echo "GCC ${major} is too old for this CI policy (need >= 13)." >&2
+              exit 1
+            fi
+          else
+            # Works for both upstream Clang and Apple Clang output formats.
+            major=$("${{ matrix.cxx }}" --version | sed -nE '1s/.*version ([0-9]+).*/\1/p')
+            if [[ -z "${major}" ]] || (( major < 16 )); then
+              echo "Clang ${major:-unknown} is too old for this CI policy (need >= 16)." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Configure (Release)
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SAN_FLAGS=""
+          if [[ "${{ matrix.sanitizer }}" == "true" ]]; then
+            SAN_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          fi
+
+          # Build from project root so top-level test/benchmark targets are included.
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=23 \
+            -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+            -DCMAKE_CXX_EXTENSIONS=OFF \
+            -DCMAKE_CXX_FLAGS="${SAN_FLAGS}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${SAN_FLAGS}" \
+            -DCMAKE_SHARED_LINKER_FLAGS="${SAN_FLAGS}"
+
+      - name: Build core + tests + benchmarks
+        run: |
+          cmake --build build --config Release --parallel \
+            --target forge_tests forge_vector_benchmarks
+
+      - name: Run unit tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:check_initialization_order=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ctest --test-dir build --build-config Release --output-on-failure

@@ -1,0 +1,3 @@
+add_executable(forge_vector_example vector_example.cpp)
+
+target_link_libraries(forge_vector_example PRIVATE forge)

@@ -1,0 +1,53 @@
+# Generated/build files
+build/
+build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Build artifacts
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+*.out
+*.elf
+
+# Diagnostics, Sanitizers and Core Dumps
+asan.log.*
+ubsan.log.*
+core
+core.*
+*.log
+
+# Coverage / profiling
+*.gcda
+*.gcno
+*.gcov
+coverage/
+
+# Doxygen / documentation output
+/docs/generated/
+
+# Editor/backups
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Tools and caching
+.ccache/
+tags
+cscope.*
