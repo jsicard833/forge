@@ -56,11 +56,19 @@ jobs:
         with:
           cmake-version: '3.29.6'
 
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install catch2 googlebenchmark ninja
+
       - name: Install Linux toolchains
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-13 g++-13 clang-18 lld-18 ninja-build
+          sudo apt-get install -y \
+            gcc-13 g++-13 clang-18 lld-18 ninja-build \
+            catch2 libbenchmark-dev
 
       - name: Validate compiler versions
         shell: bash
