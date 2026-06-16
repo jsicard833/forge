@@ -2222,6 +2222,33 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
         }
 
         /**
+         * @brief Accesses a member of the pointed-to element via the arrow operator (const version)
+         *
+         * Equivalent to (*it).member, allowing direct member access syntax. Useful when iterating
+         * over containers of complex objects.
+         *
+         * @return A pointer to the element, for member access.
+         *
+         * @complexity \f$ O(1) \f$
+         * @exception noexcept
+         *
+         * @pre The iterator must be valid and dereferenceable (not past-the-end).
+         * @pre The element must have accessible members (not a primitive type).
+         *
+         * @example
+         * @code
+         * for (auto it = vec.begin(); it != vec.end(); ++it)
+         *     it->member = value;  // Uses operator->()
+         * @endcode
+         *
+         * @see operator*() for dereferencing
+         */
+        constexpr pointer operator->() const noexcept
+        {
+            return ptr_;
+        }
+
+        /**
          * @brief Accesses an element at an offset from the current position
          *
          * Provides array-like indexing relative to the iterator's current position. Equivalent to
