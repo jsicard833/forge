@@ -39,9 +39,9 @@ namespace forge
 {
 namespace detail
 {
-    // Forward declaration for test accessor template so it can be friended below
-    template <typename> struct vector_tests_accessor;
-}
+// Forward declaration for test accessor template so it can be friended below
+template <typename> struct vector_tests_accessor;
+} // namespace detail
 
 /**
  * @brief A dynamic array (vector) container with full support for custom allocators and move
@@ -288,7 +288,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     constexpr vector(InputIt first, InputIt last, const Alloc& alloc = Alloc())
         : alloc_(alloc), data_(nullptr), size_(0), capacity_(0)
     {
-        size_type n = static_cast<size_type>(std::distance(first, last));
+        auto n = static_cast<size_type>(std::distance(first, last));
 
         if (n > 0)
         {
@@ -514,7 +514,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see swap(vector&) for the underlying swap operation
      */
-    constexpr vector<T, Alloc>& operator=(const vector& other)
+    constexpr auto operator=(const vector& other) -> vector<T, Alloc>&
     {
         if (this != &other)
         {
@@ -551,13 +551,15 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see swap(vector&) for the underlying operation
      */
-    constexpr vector<T, Alloc>& operator=(vector&& other) noexcept(std::is_nothrow_swappable_v<Alloc>)
+    constexpr auto
+    operator=(vector&& other) noexcept(std::is_nothrow_swappable_v<Alloc>) -> vector<T, Alloc>&
     {
         if (this != &other)
         {
-            this->swap(other); // Swap the contents of the source vector with the current vector. This
-                               // efficiently transfers ownership of the resources and leaves the source
-                              // vector in a valid but unspecified state.
+            this->swap(
+                other); // Swap the contents of the source vector with the current vector. This
+                        // efficiently transfers ownership of the resources and leaves the source
+                        // vector in a valid but unspecified state.
         }
         return *this;
     }
@@ -585,7 +587,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see at(size_type) for bounds-checked access
      */
-    [[nodiscard]] constexpr reference operator[](size_type index) noexcept
+    [[nodiscard]] constexpr auto operator[](size_type index) noexcept -> reference
     {
         return data_[index];
     }
@@ -609,7 +611,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see at(size_type) const for bounds-checked access
      */
-    [[nodiscard]] constexpr const_reference operator[](size_type index) const noexcept
+    [[nodiscard]] constexpr auto operator[](size_type index) const noexcept -> const_reference
     {
         return data_[index];
     }
@@ -632,7 +634,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see operator[](size_type) for unchecked access
      */
-    [[nodiscard]] constexpr reference at(size_type index)
+    [[nodiscard]] constexpr auto at(size_type index) -> reference
     {
         if (index >= size_) [[unlikely]]
             throw std::out_of_range("Index out of range");
@@ -654,7 +656,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see operator[](size_type) const for unchecked access
      */
-    [[nodiscard]] constexpr const_reference at(size_type index) const
+    [[nodiscard]] constexpr auto at(size_type index) const -> const_reference
     {
         if (index >= size_) [[unlikely]]
             throw std::out_of_range("Index out of range");
@@ -679,7 +681,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see back() for accessing the last element
      */
-    [[nodiscard]] constexpr reference front() noexcept
+    [[nodiscard]] constexpr auto front() noexcept -> reference
     {
         return data_[0];
     }
@@ -701,7 +703,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see back() for accessing the last element
      */
-    [[nodiscard]] constexpr const_reference front() const noexcept
+    [[nodiscard]] constexpr auto front() const noexcept -> const_reference
     {
         return data_[0];
     }
@@ -724,7 +726,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see front() for accessing the first element
      */
-    [[nodiscard]] constexpr reference back() noexcept
+    [[nodiscard]] constexpr auto back() noexcept -> reference
     {
         return data_[size_ - 1];
     }
@@ -747,7 +749,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see front() for accessing the first element
      */
-    [[nodiscard]] constexpr const_reference back() const noexcept
+    [[nodiscard]] constexpr auto back() const noexcept -> const_reference
     {
         return data_[size_ - 1];
     }
@@ -771,7 +773,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see get_view() for a safer view via std::span
      */
-    [[nodiscard]] constexpr pointer data() noexcept
+    [[nodiscard]] constexpr auto data() noexcept -> pointer
     {
         return data_;
     }
@@ -795,7 +797,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see get_view() for a safer view via std::span
      */
-    [[nodiscard]] constexpr const_pointer data() const noexcept
+    [[nodiscard]] constexpr auto data() const noexcept -> const_pointer
     {
         return data_;
     }
@@ -818,7 +820,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *       the returned span is valid but empty.
      * @see std::span for documentation on the span view type
      */
-    [[nodiscard]] constexpr std::span<T> get_view() noexcept
+    [[nodiscard]] constexpr auto get_view() noexcept -> std::span<T>
     {
         return std::span<T>(data_, size_);
     }
@@ -842,7 +844,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see std::span for documentation on the span view type
      */
-    [[nodiscard]] constexpr std::span<const T> get_view() const noexcept
+    [[nodiscard]] constexpr auto get_view() const noexcept -> std::span<const T>
     {
         return std::span<const T>(data_,
                                   size_); // Return a span that views the elements of the vector
@@ -862,7 +864,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see find(const_reference) for retrieving an iterator to the found element
      */
-    [[nodiscard]] constexpr bool contains(const_reference value) const noexcept
+    [[nodiscard]] constexpr auto contains(const_reference value) const noexcept -> bool
     {
         return std::ranges::find(get_view(), value) != get_view().end();
     }
@@ -883,7 +885,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see contains(const_reference) for just checking existence without an iterator
      */
-    [[nodiscard]] constexpr const_iterator find(const_reference value) const noexcept
+    [[nodiscard]] constexpr auto find(const_reference value) const noexcept -> const_iterator
     {
         auto it = std::ranges::find(get_view(), value);
         if (it != get_view().end())
@@ -911,7 +913,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @note This allows users to query the allocator for properties, perform custom allocations, or
      *       use allocator-aware utilities. For most users, this is not commonly needed.
      */
-    constexpr allocator_type get_allocator() const noexcept
+    constexpr auto get_allocator() const noexcept -> allocator_type
     {
         return alloc_;
     }
@@ -937,7 +939,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see capacity() to get allocated storage
      * @see empty() for a boolean emptiness check
      */
-    [[nodiscard]] constexpr size_type size() const noexcept
+    [[nodiscard]] constexpr auto size() const noexcept -> size_type
     {
         return size_;
     }
@@ -962,7 +964,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see capacity() for the currently allocated size
      * @see size() for the number of elements currently stored
      */
-    [[nodiscard]] constexpr size_type max_size() const noexcept
+    [[nodiscard]] constexpr auto max_size() const noexcept -> size_type
     {
         // Use difference_type as the distance between pointers must be representable by a signed
         // integer, not unsigned
@@ -989,7 +991,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see size() for the number of elements currently stored
      * @see reserve(size_type) to request additional capacity
      */
-    [[nodiscard]] constexpr size_type capacity() const noexcept
+    [[nodiscard]] constexpr auto capacity() const noexcept -> size_type
     {
         return capacity_;
     }
@@ -1005,7 +1007,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @complexity \f$ O(1) \f$
      * @exception noexcept
      */
-    [[nodiscard]] constexpr bool empty() const noexcept
+    [[nodiscard]] constexpr auto empty() const noexcept -> bool
     {
         return size_ == 0;
     }
@@ -1027,7 +1029,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see capacity() for the number of elements that can fit
      */
-    [[nodiscard]] constexpr size_type memory_usage() const noexcept
+    [[nodiscard]] constexpr auto memory_usage() const noexcept -> size_type
     {
         return capacity_ * sizeof(value_type);
     }
@@ -1055,7 +1057,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see shrink_to_fit() to reduce capacity to match size()
      */
-    constexpr void reserve(size_type new_capacity)
+    constexpr auto reserve(size_type new_capacity) -> void
     {
         if (new_capacity > max_size()) [[unlikely]]
             throw std::length_error("vector::reserve: capacity exceeded max_size()");
@@ -1115,7 +1117,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see reserve(size_type) for the opposite operation
      */
-    constexpr void shrink_to_fit()
+    constexpr auto shrink_to_fit() -> void
     {
         // Create a temporary vector that is exactly the size of our current elements.
         // The copy constructor (or move-based constructor) will only allocate
@@ -1152,7 +1154,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see emplace_back(Args...) for in-place construction
      * @see pop_back() to remove the last element
      */
-    constexpr void push_back(const_reference value)
+    constexpr auto push_back(const_reference value) -> void
         requires std::copy_constructible<T>
     {
         emplace_back(value);
@@ -1180,7 +1182,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see emplace_back(Args...) for in-place construction
      * @see pop_back() to remove the last element
      */
-    constexpr void push_back(T&& value)
+    constexpr auto push_back(T&& value) -> void
         requires std::move_constructible<T>
     {
         emplace_back(std::move(value));
@@ -1214,7 +1216,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see pop_back() to remove the last element
      */
     template <typename... Args>
-    constexpr reference emplace_back(Args&&... args)
+    constexpr auto emplace_back(Args&&... args) -> reference
         requires std::constructible_from<T, Args...>
     {
         if (size_ >= capacity_)
@@ -1248,7 +1250,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see emplace(const_iterator, Args...) for in-place construction at arbitrary positions
      */
-    constexpr iterator insert(const_iterator pos, const_reference value)
+    constexpr auto insert(const_iterator pos, const_reference value) -> iterator
         requires std::copy_constructible<T>
     {
         return emplace(pos, value);
@@ -1278,7 +1280,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see emplace(const_iterator, Args...) for in-place construction at arbitrary positions
      */
-    constexpr iterator insert(const_iterator pos, T&& value)
+    constexpr auto insert(const_iterator pos, T&& value) -> iterator
         requires std::move_constructible<T>
     {
         return emplace(pos, std::move(value));
@@ -1309,7 +1311,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @note Invalidates iterators at and after `pos` and all pointers if reallocation occurs.
      */
-    constexpr iterator insert(const_iterator pos, size_type count, const_reference value)
+    constexpr auto insert(const_iterator pos, size_type count, const_reference value) -> iterator
         requires std::copy_constructible<T>
     {
         size_type offset = pos - cbegin();
@@ -1447,7 +1449,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @note Invalidates iterators at and after `pos` and all pointers if reallocation occurs.
      */
     template <class InputIt>
-    constexpr iterator insert(const_iterator pos, InputIt first, InputIt last)
+    constexpr auto insert(const_iterator pos, InputIt first, InputIt last) -> iterator
         requires std::input_iterator<InputIt> &&
                  std::constructible_from<T, typename std::iterator_traits<InputIt>::reference>
     {
@@ -1574,7 +1576,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @note Invalidates iterators at and after `pos` and all pointers if reallocation occurs.
      */
-    constexpr iterator insert(const_iterator pos, std::initializer_list<T> ilist)
+    constexpr auto insert(const_iterator pos, std::initializer_list<T> ilist) -> iterator
     {
         return insert(pos, ilist.begin(), ilist.end());
     }
@@ -1612,7 +1614,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see insert(const_iterator, const_reference) and insert(const_iterator, T&&) for simpler
      * element addition
      */
-    template <class... Args> constexpr iterator emplace(const_iterator pos, Args&&... args)
+    template <class... Args> constexpr auto emplace(const_iterator pos, Args&&... args) -> iterator
     {
         size_type index = pos - cbegin();
 
@@ -1695,7 +1697,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see push_back() to add elements
      * @see back() for accessing the last element
      */
-    constexpr void pop_back() noexcept
+    constexpr auto pop_back() noexcept -> void
     {
         if (size_ > 0)
         {
@@ -1725,8 +1727,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @note Invalidates iterators at and after `pos` and all pointers to elements after `pos`.
      * @see erase(const_iterator, const_iterator) to remove a range of elements
      */
-    constexpr iterator
-    erase(const_iterator pos) noexcept(std::is_nothrow_move_assignable_v<value_type>)
+    constexpr auto erase(const_iterator pos) noexcept(std::is_nothrow_move_assignable_v<value_type>) -> iterator
     {
         // Calculate raw index
         size_type index = pos - cbegin();
@@ -1770,9 +1771,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @note Invalidates iterators at and after `first` and all pointers to elements after `first`.
      * @see erase(const_iterator) to remove a single element
      */
-    constexpr iterator
-    erase(const_iterator first,
-          const_iterator last) noexcept(std::is_nothrow_move_assignable_v<value_type>)
+    constexpr auto erase(const_iterator first, const_iterator last) noexcept(std::is_nothrow_move_assignable_v<value_type>) -> iterator
     {
         size_type index_first = first - cbegin();
 
@@ -1827,7 +1826,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see resize(size_type, const_reference) to resize with specific fill value
      */
-    constexpr void resize(size_type new_size)
+    constexpr auto resize(size_type new_size) -> void
     {
         if (new_size > max_size()) [[unlikely]]
             throw std::length_error("vector::resize: new size exceeds max_size()");
@@ -1897,7 +1896,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see resize(size_type) for default-constructed element initialization
      */
-    constexpr void resize(size_type new_size, const_reference value)
+    constexpr auto resize(size_type new_size, const_reference value) -> void
     {
         if (new_size > max_size()) [[unlikely]]
             throw std::length_error("vector::resize: new size exceeds max_size()");
@@ -1959,7 +1958,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see shrink_to_fit() to release excess capacity
      * @see ~vector() to completely destroy the vector
      */
-    constexpr void clear() noexcept
+    constexpr auto clear() noexcept -> void
     {
         while (size_ > 0)
         {
@@ -1989,7 +1988,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see resize(size_type, const_reference) to change size while keeping excess capacity
      */
-    constexpr void assign(size_type count, const_reference value)
+    constexpr auto assign(size_type count, const_reference value) -> void
         requires std::copy_constructible<T>
     {
         // Create a temporary vector with desired size and content
@@ -2023,7 +2022,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      */
     template <typename InputIt>
         requires std::input_iterator<InputIt>
-    constexpr void assign(InputIt first, InputIt last)
+    constexpr auto assign(InputIt first, InputIt last) -> void
     {
         // Create a temporary vector from iterator range
         vector temp(first, last, alloc_);
@@ -2050,7 +2049,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @note All iterators and pointers are invalidated.
      * @note Enables convenient reassignment with brace syntax: v.assign({1, 2, 3, 4});
      */
-    constexpr void assign(std::initializer_list<T> init)
+    constexpr auto assign(std::initializer_list<T> init) -> void
     {
         assign(init.begin(), init.end());
     }
@@ -2073,7 +2072,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see non-member swap(vector&, vector&) for the standard free function
      */
-    constexpr void swap(vector& other) noexcept(std::is_nothrow_swappable_v<Alloc>)
+    constexpr auto swap(vector& other) noexcept(std::is_nothrow_swappable_v<Alloc>) -> void
     {
         using std::swap;
         swap(alloc_, other.alloc_);
@@ -2189,7 +2188,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          * @see operator->() to access members of the element
          * @see operator[](difference_type) for offset dereference
          */
-        constexpr reference operator*() const noexcept
+        constexpr auto operator*() const noexcept -> reference
         {
             return *ptr_;
         }
@@ -2216,7 +2215,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          *
          * @see operator*() for dereferencing
          */
-        constexpr pointer operator->() noexcept
+        constexpr auto operator->() noexcept -> pointer
         {
             return ptr_;
         }
@@ -2243,7 +2242,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          *
          * @see operator*() for dereferencing
          */
-        constexpr pointer operator->() const noexcept
+        constexpr auto operator->() const noexcept -> pointer
         {
             return ptr_;
         }
@@ -2269,7 +2268,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          * auto prev_elem = (vec.end())[−1];  // Last element
          * @endcode
          */
-        constexpr reference operator[](difference_type off) const noexcept
+        constexpr auto operator[](difference_type off) const noexcept -> reference
         {
             return *(ptr_ + off);
         }
@@ -2292,7 +2291,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          *
          * @see operator+=(difference_type) for larger advances
          */
-        constexpr base_iterator& operator++() noexcept
+        constexpr auto operator++() noexcept -> base_iterator&
         { // Pre-increment
             ++ptr_;
             return *this;
@@ -2313,7 +2312,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          *
          * @see operator+=(difference_type) for larger advances
          */
-        constexpr base_iterator operator++(int) noexcept
+        constexpr auto operator++(int) noexcept -> base_iterator
         { // Post-increment
             base_iterator temp = *this;
             ++(*this);
@@ -2335,7 +2334,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          *
          * @see operator-=(difference_type) for larger backward moves
          */
-        constexpr base_iterator& operator--() noexcept
+        constexpr auto operator--() noexcept -> base_iterator&
         { // Pre-decrement
             --ptr_;
             return *this;
@@ -2356,7 +2355,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          *
          * @see operator-=(difference_type) for larger backward moves
          */
-        constexpr base_iterator operator--(int) noexcept
+        constexpr auto operator--(int) noexcept -> base_iterator
         { // Post-decrement
             base_iterator temp = *this;
             --(*this);
@@ -2383,7 +2382,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          * @see operator+(difference_type) for creating a new iterator
          * @see operator++() for single-step increment
          */
-        constexpr base_iterator& operator+=(difference_type off) noexcept
+        constexpr auto operator+=(difference_type off) noexcept -> base_iterator&
         {
             ptr_ += off;
             return *this;
@@ -2407,7 +2406,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          * @see operator-(difference_type) for creating a new iterator
          * @see operator--() for single-step decrement
          */
-        constexpr base_iterator& operator-=(difference_type off) noexcept
+        constexpr auto operator-=(difference_type off) noexcept -> base_iterator&
         {
             ptr_ -= off;
             return *this;
@@ -2428,7 +2427,8 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          *
          * @see operator+=(difference_type) for in-place advance
          */
-        constexpr friend base_iterator operator+(base_iterator it, difference_type off) noexcept
+        constexpr friend auto operator+(base_iterator it,
+                                        difference_type off) noexcept -> base_iterator
         {
             it += off;
             return it;
@@ -2449,7 +2449,8 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          *
          * @see operator+=(difference_type) for in-place advance
          */
-        constexpr friend base_iterator operator+(difference_type off, base_iterator it) noexcept
+        constexpr friend auto operator+(difference_type off,
+                                        base_iterator it) noexcept -> base_iterator
         {
             it += off;
             return it;
@@ -2470,7 +2471,8 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          *
          * @see operator-=(difference_type) for in-place backward move
          */
-        constexpr friend base_iterator operator-(base_iterator it, difference_type off) noexcept
+        constexpr friend auto operator-(base_iterator it,
+                                        difference_type off) noexcept -> base_iterator
         {
             it -= off;
             return it;
@@ -2498,8 +2500,8 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          * auto distance = it2 - it1;  // Returns 5
          * @endcode
          */
-        constexpr friend difference_type operator-(const base_iterator& lhs,
-                                                   const base_iterator& rhs) noexcept
+        constexpr friend auto operator-(const base_iterator& lhs,
+                                        const base_iterator& rhs) noexcept -> difference_type
         {
             return lhs.ptr_ - rhs.ptr_;
         }
@@ -2547,7 +2549,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see end() for the past-the-end iterator
      * @see cbegin() for a const version
      */
-    [[nodiscard]] constexpr iterator begin() noexcept
+    [[nodiscard]] constexpr auto begin() noexcept -> iterator
     {
         return iterator(data_);
     }
@@ -2569,7 +2571,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see cend() for the corresponding past-the-end iterator
      */
-    [[nodiscard]] constexpr const_iterator begin() const noexcept
+    [[nodiscard]] constexpr auto begin() const noexcept -> const_iterator
     {
         return const_iterator(data_);
     }
@@ -2592,7 +2594,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see cend() for the past-the-end variant
      * @see begin() for the non-const version
      */
-    [[nodiscard]] constexpr const_iterator cbegin() const noexcept
+    [[nodiscard]] constexpr auto cbegin() const noexcept -> const_iterator
     {
         return const_iterator(data_);
     }
@@ -2618,7 +2620,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see begin() for the first element iterator
      * @see cend() for the const version
      */
-    [[nodiscard]] constexpr iterator end() noexcept
+    [[nodiscard]] constexpr auto end() noexcept -> iterator
     {
         return iterator(data_ + size_);
     }
@@ -2641,7 +2643,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see cbegin() for the corresponding first element iterator
      */
-    [[nodiscard]] constexpr const_iterator end() const noexcept
+    [[nodiscard]] constexpr auto end() const noexcept -> const_iterator
     {
         return const_iterator(data_ + size_);
     }
@@ -2667,7 +2669,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see cbegin() for the past-the-beginning variant
      * @see end() for the non-const version
      */
-    [[nodiscard]] constexpr const_iterator cend() const noexcept
+    [[nodiscard]] constexpr auto cend() const noexcept -> const_iterator
     {
         return const_iterator(data_ + size_);
     }
@@ -2699,7 +2701,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see reserve(size_type) for requesting specific capacity
      */
-    constexpr void reallocate()
+    constexpr auto reallocate() -> void
     {
         // Calculate new capacity: 1.5x growth or start at 1
         // We use size_type to avoid floating point math where possible
@@ -2757,7 +2759,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
  * @relates forge::vector
  */
 template <typename T, typename Alloc>
-constexpr void swap(vector<T, Alloc>& lhs, vector<T, Alloc>& rhs) noexcept
+constexpr auto swap(vector<T, Alloc>& lhs, vector<T, Alloc>& rhs) noexcept -> void
 {
     lhs.swap(rhs);
 }
