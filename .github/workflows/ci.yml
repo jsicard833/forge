@@ -60,7 +60,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew update
-          brew install catch2 googlebenchmark ninja
+          brew install catch2 google-benchmark ninja
 
       - name: Install Linux toolchains
         if: runner.os == 'Linux'
