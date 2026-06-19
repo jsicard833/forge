@@ -69,6 +69,13 @@ The important lifecycle phases are:
 
 That sequence is reflected consistently across construction, `reserve()`, `resize()`, `insert()`, and destruction.
 
+#### Hardening Against Self-Insertion Invalidation
+In v0.1.1, the mutating pipeline is strictly hardened against self-insertion corruption (e.g., executing `vec.push_back(vec[0])` or `vec.emplace(vec.begin(), vec.back())`). 
+
+If a capacity growth check triggers during a push/emplace action, the old backing buffer cannot simply be destroyed before object instantiation. Instead, the container leverages isolated helper state machines (`emplace_reallocate` and `insert_n`) to instantiate the incoming element directly into the **new** allocation *before* migrating existing elements or purging the old buffer. 
+
+For in-place insertion mutations (where capacity is already sufficient but existing elements must be shifted downward), incoming elements are fully materialized into localized stack temporaries prior to tail-shifting mechanics. This completely prevents active memory layout adjustments from mutating or invalidating the user’s argument references midway through an operation.
+
 ---
 
 ## 3. Implementation Details & Algorithmic Complexity
@@ -87,31 +94,35 @@ The table below summarizes the main operations that matter most to users and ben
 | `find()` | $O(N)$ | Linear search with iterator result. |
 | `get_view()` | $O(1)$ | Non-owning `std::span` view. |
 
-### Exception Safety Engineering
+### Advanced C++23 Idiom: Deducing `this`
 
-Most mutating operations aim for the strong exception guarantee when practical, but `erase()` is intentionally documented and implemented at the basic guarantee level.
+To eradicate structural code duplication across const and non-const method pairings, `forge::vector` replaces duplicated member boilerplate with C++23 **Explicit Object Parameters** (`this auto&& self`). 
 
-The current `erase()` implementation shifts elements left using assignment, then destroys the trailing slot. That approach is safer than trying to destroy and reconstruct a whole tail segment because it minimizes the number of operations that can fail and keeps the container in a valid state even if move assignment throws. In other words, the container can be partially shifted, but it does not leak memory or violate internal invariants.
+Instead of generating split const/non-const functions for `operator[]`, `at()`, `front()`, `back()`, `data()`, `get_view()`, `find()`, `begin()`, and `end()`, a single template function automatically maps the element type qualifiers based on the value category and mutability of the calling object. This ensures that maintenance costs are halved, and fixes or contract additions applied to element access affect both mutable and immutable code paths identically.
 
-That trade-off is appropriate for a contiguous sequence container: the operation remains efficient, the invariants stay simple, and the implementation avoids overly complex rollback machinery.
+### Code Consolidation: The Internal Helper Architecture
+To preserve the DRY (Don't Repeat Yourself) principle, low-level iteration loops and shift patterns have been centralized into a robust suite of private helper routines such as:
+- `emplace_reallocate(Args&&...)`: Isolated allocation path that safely captures arguments, provisions new heap blocks, constructs the incoming item, and then cleans up old storage.
+- `insert_n(const_iterator pos, size_type count, FillGapFn&&, AppendFn&&)`: A highly generalized insertion engine. It manages the index math required for gap creation, coordinates rollback operations if copy/move actions throw, and executes the shift routines uniformly.
+- `relocate_elements(pointer dst)`: tandardizes the movement of data arrays during reallocations.
 
-### Primitive Optimization Fast-Paths
+### Custom-Allocator Aware Trivial Fast-Paths
+The baseline implementation handles trivial type optimizations with a high degree of correctness. It does not blindly invoke `std::memcpy` or skip destructor iterations simply because `std::is_trivially_copyable_v<T>` evaluates to true.
 
-The current implementation is intentionally conservative and uses allocator traits, construction, destruction, and move-if-noexcept mechanics consistently.
+If a user configures `forge::vector` with a highly specialized or stateful custom allocator that overrides `construct()` or `destroy()`, bypassing those routines would break custom behaviors like element tracking arenas or diagnostic logging pools.
 
-The next optimization layer will be structured around compile-time type traits, for example:
-
+To verify absolute safety, the library exposes sophisticated concept checks within forge::detail such as:
 ```cpp
-if constexpr (std::is_trivially_copyable_v<T>) {
-		// Use raw memory moves where it is valid and profitable.
-}
-
-if constexpr (std::is_trivially_destructible_v<T>) {
-		// Skip per-element destruction work for trivial types.
-}
+template <typename T, typename Alloc>
+inline constexpr bool trivially_manipulable_v =
+    std::is_trivially_copyable_v<T> && 
+    !allocator_has_custom_construct<Alloc, T> &&
+    !allocator_has_custom_destroy<Alloc, T>;
 ```
 
-This direction keeps the current architecture ready for raw-memory acceleration without forcing specialization complexity into the baseline implementation.
+When `trivially_manipulable_v` or `trivially_destructible_v` resolves to true at compile time, the container drops manual element-by-element tracking loops. During compilation, loops inside `reserve()`, `insert_n()`, `erase()`, and `resize()` collapse cleanly into `std::memcpy`, `std::memmove`, or zero-cost compile-time no-ops. If the allocator overrides construction or destruction traits, the container securely defaults to standard `std::allocator_traits` execution routines.
+
+Additionally, runtime paths use C++20 branch prediction hints (`[[likely]]` / `[[unlikely]]`) on high-frequency paths—such as capacity verification checks and empty array boundary assertions—to ensure optimal CPU instruction pipelining.
 
 ### API Surface Notes
 
@@ -239,12 +250,10 @@ As depicted in the benchmark matrix, the performance characteristics divide clea
 
 ### Short-Term Tracking Items
 
-- Finalize trivial-type fast paths for copying, moving, and destruction.
-- Tighten any remaining documentation gaps once the implementation stops moving.
+- Build out full reverse iterator support (`rbegin()`, `rend()`, `crbegin()`, `crend()`).
 
 ### Long-Term Architectural Explorations
 
-- Custom allocator propagation policies beyond the current baseline behavior.
 - More aggressive optimizations using profiling tools.
 - Reverse iterator support
 - Additional container-wide policies that may be useful for future data structures.
