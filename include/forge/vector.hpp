@@ -24,8 +24,10 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
 #include <concepts>
 #include <cstddef>
+#include <cstring>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
@@ -41,6 +43,31 @@ namespace detail
 {
 // Forward declaration for test accessor template so it can be friended below
 template <typename> struct vector_tests_accessor;
+
+template <typename Alloc, typename T>
+concept allocator_has_custom_construct = requires(Alloc& a, T* p, T&& rv) {
+    a.construct(p, std::move(rv));
+} || requires(Alloc& a, T* p, const T& lv) { a.construct(p, lv); };
+
+template <typename Alloc, typename T>
+concept allocator_has_custom_default_construct = requires(Alloc& a, T* p) { a.construct(p); };
+
+template <typename Alloc, typename T>
+concept allocator_has_custom_destroy = requires(Alloc& a, T* p) { a.destroy(p); };
+
+template <typename T, typename Alloc>
+inline constexpr bool trivially_manipulable_v =
+    std::is_trivially_copyable_v<T> && !allocator_has_custom_construct<Alloc, T> &&
+    !allocator_has_custom_destroy<Alloc, T>;
+
+template <typename T, typename Alloc>
+inline constexpr bool trivially_destructible_v =
+    std::is_trivially_destructible_v<T> && !allocator_has_custom_destroy<Alloc, T>;
+
+template <typename T, typename Alloc>
+inline constexpr bool trivially_value_initializable_v =
+    std::is_trivially_default_constructible_v<T> &&
+    !allocator_has_custom_default_construct<Alloc, T> && !allocator_has_custom_destroy<Alloc, T>;
 } // namespace detail
 
 /**
@@ -79,10 +106,6 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     // Type aliases
     // =========================================================
 
-    template <typename U>
-    class base_iterator; // Forward declaration of the base iterator class to be used in the type
-                         // aliases for iterator and const_iterator
-
     using value_type = T;
     using allocator_type = Alloc;
     using difference_type = std::ptrdiff_t;
@@ -91,6 +114,9 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     using pointer = T*;
     using const_pointer = const T*;
     using size_type = std::size_t;
+
+    template <typename U> class base_iterator;
+
     using iterator = base_iterator<T>;
     using const_iterator = base_iterator<const T>;
 
@@ -171,31 +197,38 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
             return;
         }
         else if (count > max_size()) [[unlikely]]
-        {
             throw std::length_error("Count exceeds maximum size");
-        }
 
         data_ = traits::allocate(alloc_, count);
 
-        // Use a try-catch block to ensure that if an exception is thrown during element
-        // construction, we properly clean up any already constructed elements and deallocate the
-        // memory to prevent leaks
-        try
+        if constexpr (detail::trivially_value_initializable_v<T, Alloc>)
         {
-            for (; size_ < count; ++size_)
-            {
-                traits::construct(alloc_, data_ + size_);
-            }
+            // For trivially default-constructible types, we can skip explicit construction since
+            // the memory is already allocated and considered "constructed" in a trivial sense.
+            size_ = count;
         }
-        catch (...)
+        else
         {
-            // Destory any already constructed elements in reverse order of construction
-            while (size_ > 0)
+            // Use a try-catch block to ensure that if an exception is thrown during element
+            // construction, we properly clean up any already constructed elements and deallocate
+            // the memory to prevent leaks
+            try
             {
-                traits::destroy(alloc_, data_ + (--size_));
+                for (; size_ < count; ++size_)
+                {
+                    traits::construct(alloc_, data_ + size_);
+                }
             }
-            traits::deallocate(alloc_, data_, capacity_); // Deallocate the memory
-            throw; // Rethrow the exception to propagate it to the caller
+            catch (...)
+            {
+                // Destory any already constructed elements in reverse order of construction
+                while (size_ > 0)
+                {
+                    traits::destroy(alloc_, data_ + (--size_));
+                }
+                traits::deallocate(alloc_, data_, capacity_); // Deallocate the memory
+                throw; // Rethrow the exception to propagate it to the caller
+            }
         }
     }
 
@@ -211,6 +244,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @complexity \f$ O(\mbox{count}) \f$
      * @exception std::bad_alloc if memory allocation fails
+     * @exception std::length_error if count exceeds max_size()
      * @exception ... Any exception thrown by T's copy constructor
      *
      * @exception_safety Strong exception safety: if any constructor throws, the vector is left
@@ -228,30 +262,19 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
             return;
         }
         else if (count > max_size()) [[unlikely]]
-        {
             throw std::length_error("Count exceeds maximum size");
-        }
+
         data_ = traits::allocate(alloc_, count);
 
-        // Use a try-catch block to ensure that if an exception is thrown during element
-        // construction, we properly clean up any already constructed elements and deallocate the
-        // memory to prevent leaks
         try
         {
-            for (; size_ < count; ++size_)
-            {
-                traits::construct(alloc_, data_ + size_, value);
-            }
+            construct_fill(data_, count, value);
+            size_ = count;
         }
         catch (...)
         {
-            // Destory any already constructed elements in reverse order of construction
-            while (size_ > 0)
-            {
-                traits::destroy(alloc_, data_ + (--size_));
-            }
-            traits::deallocate(alloc_, data_, capacity_); // Deallocate the memory
-            throw; // Rethrow the exception to propagate it to the caller
+            traits::deallocate(alloc_, data_, capacity_);
+            throw;
         }
     }
 
@@ -270,12 +293,19 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *              Must be reachable from `first` by repeated increments.
      * @param alloc The allocator instance for memory management. Defaults to Alloc().
      *
-     * @complexity \f$ O(n) \f$ where n = std::distance(first, last)
+     * @complexity
+     * - \f$ O(n) \f$ element copies/moves for non-trivial types.
+     * - \f$ O(1) \f$ algorithmic time (via block memory copies) for trivially copyable types using
+     * contiguous iterators.
+     * - Reallocations may incur an additional amortized complexity cost if a pure non-forward
+     * `std::input_iterator` is utilized.
+     *
      * @exception std::bad_alloc if memory allocation fails
+     * @exception std::length_error if computed range distance exceeds max_size().
      * @exception ... Any exception thrown by T's copy/move constructor
      *
-     * @exception_safety Strong exception safety: if any constructor throws, the vector remains
-     *                    empty, and no resources are leaked.
+     * @exception_safety Strong exception safety: if any constructor or allocation throws, the
+     * vector remains empty, and no resources or partially constructed elements are leaked.
      *
      * @note The distance between iterators is computed even if the range is empty.
      * @note Undefined behavior if [first, last) is not a valid range or if iterators come from
@@ -288,38 +318,46 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     constexpr vector(InputIt first, InputIt last, const Alloc& alloc = Alloc())
         : alloc_(alloc), data_(nullptr), size_(0), capacity_(0)
     {
-        auto n = static_cast<size_type>(std::distance(first, last));
-
-        if (n > 0)
+        // Safe Path for non-forward iterators (cannot pre-calculate distance)
+        if constexpr (std::forward_iterator<InputIt>)
         {
+            auto n = static_cast<size_type>(std::distance(first, last));
+            if (n == 0)
+                return;
+
+            if (n > max_size()) [[unlikely]]
+                throw std::length_error("Range size exceeds maximum size");
+
             data_ = traits::allocate(alloc_, n);
             capacity_ = n;
 
             try
             {
+                copy_construct_range(data_, first, n);
+                size_ = n;
+            }
+            catch (...)
+            {
+                traits::deallocate(alloc_, data_, capacity_);
+                data_ = nullptr;
+                capacity_ = 0;
+                throw;
+            }
+        }
+        else
+        {
+            try
+            {
                 while (first != last)
                 {
-                    traits::construct(alloc_, data_ + size_, *first);
-                    ++size_;
+                    emplace_back(*first);
                     ++first;
                 }
             }
             catch (...)
             {
-                // If any constructor throws we clean up everything
-                for (size_type i = 0; i < size_; ++i)
-                {
-                    traits::destroy(alloc_, data_ + i);
-                }
-                traits::deallocate(alloc_, data_, capacity_);
-
-                // Set pointers to null so the destructor won't attempt to clean up memory that has
-                // already been cleaned up
-                data_ = nullptr;
-                size_ = 0;
-                capacity_ = 0;
-
-                throw; // Rethrow the exception to propagate it to the caller
+                clear();
+                throw;
             }
         }
     }
@@ -349,43 +387,8 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *       construction time.
      */
     constexpr vector(std::initializer_list<T> init, const Alloc& alloc = Alloc())
-        : alloc_(alloc), size_(0), capacity_(init.size())
+        : vector(init.begin(), init.end(), alloc)
     {
-        if (capacity_ > 0)
-        {
-            data_ = traits::allocate(alloc_, capacity_);
-
-            try
-            {
-                for (const auto& item : init)
-                {
-                    traits::construct(alloc_, data_ + size_, item);
-                    ++size_; // Only increment after a successful construction
-                }
-            }
-            catch (...)
-            {
-                // If any constructor throws we clean up everything
-                for (size_type i = 0; i < size_; ++i)
-                {
-                    traits::destroy(alloc_, data_ + i);
-                }
-                traits::deallocate(alloc_, data_, capacity_);
-
-                // Reset members to a safe state before rethrowing
-                data_ = nullptr;
-                size_ = 0;
-                capacity_ = 0;
-
-                throw;
-            }
-        }
-        else
-        {
-            // If the initializer list is empty, we just initialize to an empty state without
-            // allocating memory
-            data_ = nullptr;
-        }
     }
 
     /**
@@ -393,8 +396,9 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * Constructs a new vector as a complete independent copy of `other`. All elements are copied
      * from the source vector, and new memory is allocated. The allocator is selected according to
-     * allocator traits (POCCA - propagate on container copy assignment).
-     * Both size and capacity of the new vector match the source.
+     * allocator traits via `select_on_container_copy_construction` (SOCCC), which delegates the
+     * choice of whether to propagate the source allocator to the allocator type itself.
+     * The size of the new vector will match the source while the capacity will shrink to fit.
      *
      * @param other The source vector to copy from. Must be a valid vector object (may be empty).
      *
@@ -411,38 +415,9 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *       which may or may not propagate the allocator depending on the allocator type.
      */
     constexpr vector(const vector& other)
-        : alloc_(traits::select_on_container_copy_construction(other.alloc_)), data_(nullptr),
-          size_(0), capacity_(other.size_)
+        : vector(other.data_, other.data_ + other.size_,
+                 traits::select_on_container_copy_construction(other.alloc_))
     {
-        if (other.capacity_ > 0)
-        {
-            data_ = traits::allocate(alloc_, capacity_);
-
-            try
-            {
-                for (; size_ < other.size_; ++size_)
-                {
-                    traits::construct(alloc_, data_ + size_, other.data_[size_]);
-                }
-            }
-            catch (...)
-            {
-                // If any constructor throws we clean up everything
-                for (size_type i = 0; i < size_; ++i)
-                {
-                    traits::destroy(alloc_, data_ + i);
-                }
-                traits::deallocate(alloc_, data_, capacity_);
-
-                // Set pointers to null so the destructor won't attempt to clean up memory that has
-                // already been cleaned up
-                data_ = nullptr;
-                size_ = 0;
-                capacity_ = 0;
-
-                throw; // Rethrow the exception to propagate it to the caller
-            }
-        }
     }
 
     /**
@@ -461,13 +436,9 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @note Allocator is moved (not copied), so the new vector takes ownership of the allocator.
      */
     constexpr vector(vector&& other) noexcept(std::is_nothrow_move_constructible_v<Alloc>)
-        : alloc_(std::move(other.alloc_)), data_(other.data_), size_(other.size_),
-          capacity_(other.capacity_)
+        : alloc_(std::move(other.alloc_)), data_(std::exchange(other.data_, nullptr)),
+          size_(std::exchange(other.size_, 0)), capacity_(std::exchange(other.capacity_, 0))
     {
-        other.data_ =
-            nullptr; // Nullify the source vector's data pointer to prevent double deletion
-        other.size_ = 0;
-        other.capacity_ = 0;
     }
 
     /**
@@ -477,13 +448,20 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * underlying memory through the allocator. If the vector was never allocated (size and
      * capacity both zero), this is a no-op.
      *
-     * @complexity \f$ O(\mbox{size}) \f$
+     * @complexity \f$ O(\mbox{size}) \f$ for non-trivial types, \f$ O(1) \f$ for trivial types.
      */
     constexpr ~vector() noexcept
     {
         if (data_)
         {
-            clear();
+            if constexpr (!detail::trivially_destructible_v<value_type, Alloc>)
+            {
+                for (size_type i = 0; i < size_; ++i)
+                {
+                    traits::destroy(alloc_, data_ + i);
+                }
+            }
+
             traits::deallocate(alloc_, data_, capacity_);
         }
     }
@@ -514,9 +492,9 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see swap(vector&) for the underlying swap operation
      */
-    constexpr auto operator=(const vector& other) -> vector<T, Alloc>&
+    constexpr auto operator=(const vector& other) -> vector&
     {
-        if (this != &other)
+        if (this != &other) [[likely]]
         {
             // Use the copy-and-swap idiom to provide strong exception safety. We create a temporary
             // copy of the source vector, and then swap its contents with the current vector. If any
@@ -534,32 +512,82 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     }
 
     /**
-     * @brief Move assignment operator - efficiently transfers ownership
+     * @brief Move assignment operator - transfers ownership per allocator-aware container rules
      *
-     * Efficiently replaces the contents of this vector by taking ownership of resources from
-     * `other`. The source vector is left in a valid but empty state. This uses the
-     * swap operation for maximum efficiency.
+     * Replaces the contents of this vector with those of `other`. The exact strategy
+     * depends on the allocator's propagation traits:
+     *
+     *  - If `propagate_on_container_move_assignment` is `true`, this vector releases its
+     *    own storage, adopts `other`'s allocator, and steals `other`'s buffer outright.
+     *  - Else if the allocators compare equal (or `is_always_equal` is `true`), this
+     *    vector keeps its own allocator but can still steal `other`'s buffer, since the
+     *    allocator that freed it doesn't matter.
+     *  - Otherwise (unequal, non-propagating allocators), this vector cannot take
+     *    ownership of `other`'s memory at all. It instead move-assigns element-by-element
+     *    into its own (possibly reused, possibly reallocated) storage using its own
+     *    allocator, leaving `other`'s storage and size untouched but its elements
+     *    individually moved-from.
      *
      * @param other The source vector to move from. Will be left in a valid but empty state.
      * @return A reference to *this, allowing for chaining assignments.
      *
-     * @complexity \f$ O(1) \f$
-     * @exception noexcept(std::is_nothrow_swappable_v<Alloc>)
+     * @complexity O(1) on the propagating or equal-allocator paths (pointer/allocator swap only).
+     *             O(n) on the unequal, non-propagating allocator fallback path, with possible
+     *             reallocation if `other.size() > capacity()`.
      *
-     * @note The source vector can be safely destroyed or reused after the operation.
-     * @note Allocators are swapped (not moved), so resource ownership is completely transferred.
+     * @exception
+     * noexcept(std::allocator_traits<Alloc>::propagate_on_container_move_assignment::value
+     *                      || std::allocator_traits<Alloc>::is_always_equal::value)
+     *            The fallback path is only reachable when this expression is `false`, since an
+     *            unequal, non-propagating allocator implies elements may need to be individually
+     *            move-assigned/move-constructed and storage may need to be (re)allocated, either of
+     *            which can throw depending on `T`'s move constructor/assignment and the allocator.
+     *
+     * @note On the propagating and equal-allocator paths, `other` is left valid and empty
+     *       (`size() == 0`), matching the typical "moved-from vector" expectation.
+     * @note On the unequal, non-propagating allocator fallback path, `other` is left in a
+     *       valid but *unspecified* state: its size is unchanged, but each element has been
+     *       individually moved-from and should not be relied upon for its prior value.
+     * @note Allocators are propagated (not swapped) when `propagate_on_container_move_assignment`
+     *       is `true`; otherwise this vector's own allocator is preserved for the lifetime of
+     *       the call, in line with allocator-aware container requirements.
      *
      * @see swap(vector&) for the underlying operation
      */
     constexpr auto
-    operator=(vector&& other) noexcept(std::is_nothrow_swappable_v<Alloc>) -> vector<T, Alloc>&
+    operator=(vector&& other) noexcept(traits::propagate_on_container_move_assignment::value ||
+                                       traits::is_always_equal::value) -> vector&
     {
-        if (this != &other)
+        if (this != &other) [[likely]]
         {
-            this->swap(
-                other); // Swap the contents of the source vector with the current vector. This
-                        // efficiently transfers ownership of the resources and leaves the source
-                        // vector in a valid but unspecified state.
+            if constexpr (traits::propagate_on_container_move_assignment::value)
+            {
+                // POCMA true: we're required to take over the allocator,
+                // so stealing the buffer is always safe.
+                clear();
+                traits::deallocate(alloc_, data_, capacity_);
+                alloc_ = std::move(other.alloc_);
+                data_ = std::exchange(other.data_, nullptr);
+                size_ = std::exchange(other.size_, 0);
+                capacity_ = std::exchange(other.capacity_, 0);
+            }
+            else if (traits::is_always_equal::value || alloc_ == other.alloc_)
+            {
+                // Allocators are interchangeable, so keep our own allocator and steal the buffer.
+                clear();
+                traits::deallocate(alloc_, data_, capacity_);
+                data_ = std::exchange(other.data_, nullptr);
+                size_ = std::exchange(other.size_, 0);
+                capacity_ = std::exchange(other.capacity_, 0);
+            }
+            else
+            {
+                // Allocators differ and won't propagate, so we can't steal the buffer. Instead, we
+                // need to move-assign each element individually. This is less efficient but
+                // necessary to maintain correct allocator semantics.
+                assign(std::make_move_iterator(other.begin()),
+                       std::make_move_iterator(other.end()));
+            }
         }
         return *this;
     }
@@ -572,59 +600,51 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     /**
      * @brief Provides unchecked access to an element by index using array subscript syntax
      *
-     * Allows efficient direct access to elements using operator[] syntax, like built-in arrays.
-     * No bounds checking is performed, making this the fastest access method. The caller is
-     * responsible for ensuring the index is within [0, size()).
+     * Allows efficient direct access to elements using operator[] syntax. This function leverages
+     * C++23 explicit object parameters ("deducing this") to unify const, non-const, lvalue, and
+     * rvalue access into a single implementation without duplicating code.
      *
+     * @param self The deduced instance of the vector (handles cv-ref qualifiers automatically).
      * @param index The zero-based index of the element to access.
      *              Must be less than size(); behavior is undefined otherwise.
-     * @return A reference to the element at the specified index, allowing reads and modifications.
+     * @return A forwarded reference to the element at the specified index (`T&`, `const T&`, `T&&`,
+     * or `const T&&` depending on how the vector itself was accessed).
      *
      * @complexity \f$ O(1) \f$
      * @exception noexcept
      *
-     * @note For safety-critical code, use at(size_type) instead, which performs bounds checking.
+     * @note **Debug Hardening:** If compiled in debug mode (where `NDEBUG` is not defined),
+     * this operator will perform a swift boundary check via an internal `assert`.
+     * In release configurations, this assertion is stripped out entirely, meaning out-of-bounds
+     * access will result in classic Undefined Behavior (UB) to maintain zero-overhead performance.
+     * @note For safety-critical code where runtime bounds-checking is strictly mandatory in
+     * production, use the `at(size_type)` member function instead.
      *
-     * @see at(size_type) for bounds-checked access
+     * @see at(size_type) for production-enforced bounds-checked access
      */
-    [[nodiscard]] constexpr auto operator[](size_type index) noexcept -> reference
+    [[nodiscard]] constexpr auto operator[](this auto&& self,
+                                            size_type index) noexcept -> decltype(auto)
     {
-        return data_[index];
-    }
-
-    /**
-     * @brief Provides unchecked const access to an element by index
-     *
-     * Const version of operator[]. Allows efficient read-only access to elements via array-like
-     * syntax on const vectors. No bounds checking is performed. The caller is responsible for
-     * ensuring the index is within [0, size()).
-     *
-     * @param index The zero-based index of the element to access.
-     *              Must be less than size(); behavior is undefined otherwise.
-     * @return A const reference to the element at the specified index.
-     *
-     * @complexity \f$ O(1) \f$
-     * @exception noexcept
-     *
-     * @note For safety-critical code, use at(size_type) const instead, which performs bounds
-     * checking.
-     *
-     * @see at(size_type) const for bounds-checked access
-     */
-    [[nodiscard]] constexpr auto operator[](size_type index) const noexcept -> const_reference
-    {
-        return data_[index];
+        // We use an assert here to catch out-of-bounds access in debug builds. In release builds,
+        // this will be a no-op, and the behavior will be undefined if the index is out of bounds.
+        // This allows us to provide maximum performance while still catching errors during
+        // development.
+        assert(index < self.size_ && "forge::vector::operator[] index out of bounds!");
+        return self.data_[index];
     }
 
     /**
      * @brief Provides bounds-checked access to an element by index
      *
      * Safely accesses an element by index, throwing std::out_of_range if the index is invalid.
-     * Slightly slower than operator[] due to bounds checking, but provides guaranteed safety.
+     * Uses C++23 explicit object parameters to unify const and non-const overloads into a
+     * single high-performance implementation.
      *
+     * @param self The deduced instance of the vector (handles cv-ref qualifiers automatically).
      * @param index The zero-based index of the element to access.
      *              Must be less than size().
-     * @return A reference to the element at the specified index.
+     * @return A forwarded reference to the element at the specified index (`T&`, `const T&`, `T&&`,
+     * or `const T&&` depending on how the vector itself was accessed).
      *
      * @complexity \f$ O(1) \f$
      * @exception std::out_of_range if index >= size()
@@ -634,270 +654,145 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @see operator[](size_type) for unchecked access
      */
-    [[nodiscard]] constexpr auto at(size_type index) -> reference
+    [[nodiscard]] constexpr auto at(this auto&& self, size_type index) -> decltype(auto)
     {
-        if (index >= size_) [[unlikely]]
-            throw std::out_of_range("Index out of range");
-        return data_[index];
+        if (index >= self.size_) [[unlikely]]
+            throw std::out_of_range("forge::vector::at: index " + std::to_string(index) +
+                                    " is out of bounds for size " + std::to_string(self.size()));
+        return self.data_[index];
     }
 
     /**
-     * @brief Provides bounds-checked const access to an element by index
+     * @brief Provides unchecked access to the first element
      *
-     * Const version of at(). Safely accesses an element by index on const vectors,
-     * throwing std::out_of_range if the index is invalid.
+     * Returns a reference to the first element in the vector, providing maximum efficiency for
+     * direct element access. This function leverages C++23 explicit object parameters ("deducing
+     * this") to automatically unify const, non-const, lvalue, and rvalue variants into a single,
+     * clean implementation.
      *
-     * @param index The zero-based index of the element to access.
-     *              Must be less than size().
-     * @return A const reference to the element at the specified index.
+     * @param self The deduced instance of the vector (handles cv-ref qualifiers automatically).
      *
-     * @complexity \f$ O(1) \f$
-     * @exception std::out_of_range if index >= size()
-     *
-     * @see operator[](size_type) const for unchecked access
-     */
-    [[nodiscard]] constexpr auto at(size_type index) const -> const_reference
-    {
-        if (index >= size_) [[unlikely]]
-            throw std::out_of_range("Index out of range");
-        return data_[index];
-    }
-
-    /**
-     * @brief Unchecked access to the first element
-     *
-     * Returns a reference to the first element in the vector. Provides maximum efficiency for
-     * accessing the front element. Behavior is undefined if the vector is empty.
-     *
-     * @return A reference to the first element of the vector.
+     * @return A forwarded reference to the first element of the vector (`T&`, `const T&`,
+     * `T&&`, or `const T&&` depending on the cv-ref qualification of the calling object).
      *
      * @complexity \f$ O(1) \f$
      * @exception noexcept
      *
-     * @pre The vector must not be empty (size() > 0)
+     * @pre The vector must not be empty (`size() > 0`).
      *
-     * @warning Calling this function on an empty vector results in undefined behavior.
-     *          Use empty() to check before calling, or use begin() + bounds checking.
+     * @note **Debug Hardening:** If compiled in a debug configuration (where `NDEBUG` is not
+     * defined), this function executes a defensive boundary validation via an internal `assert`. In
+     * release builds, this assertion is stripped out entirely, meaning calling `front()` on an
+     * empty vector results in classic Undefined Behavior (UB) to maintain optimal performance.
+     *
+     * @warning Calling this function on an empty vector in release mode guarantees undefined
+     * behavior. Always check `empty()` beforehand if the container's operational state is
+     * uncertain.
      *
      * @see back() for accessing the last element
      */
-    [[nodiscard]] constexpr auto front() noexcept -> reference
+    [[nodiscard]] constexpr auto front(this auto&& self) noexcept -> decltype(auto)
     {
-        return data_[0];
+        assert(self.size_ > 0 && "forge::vector::front() called on empty vector!");
+        return self.data_[0];
     }
 
     /**
-     * @brief Unchecked const access to the first element
+     * @brief Provides unchecked access to the last element
      *
-     * Const version of front(). Returns a const reference to the first element.
-     * Behavior is undefined if the vector is empty.
+     * Returns a reference to the last element in the vector (at index `size() - 1`), providing
+     * maximum efficiency for direct rear-element access. This function leverages C++23 explicit
+     * object parameters ("deducing this") to automatically unify const, non-const, lvalue,
+     * and rvalue variants into a single, cohesive implementation.
      *
-     * @return A const reference to the first element of the vector.
+     * @param self The deduced instance of the vector (handles cv-ref qualifiers automatically).
+     *
+     * @return A forwarded reference to the last element of the vector (`T&`, `const T&`,
+     * `T&&`, or `const T&&` depending on the cv-ref qualification of the calling object).
      *
      * @complexity \f$ O(1) \f$
      * @exception noexcept
      *
-     * @pre The vector must not be empty (size() > 0)
+     * @pre The vector must not be empty (`size() > 0`).
      *
-     * @warning Calling this function on an empty vector results in undefined behavior.
+     * @note **Debug Hardening:** If compiled in a debug configuration (where `NDEBUG` is not
+     * defined), this function executes a defensive boundary validation via an internal `assert`. In
+     * release builds, this assertion is stripped out entirely, meaning calling `back()` on an empty
+     * vector results in classic Undefined Behavior (UB) to maintain optimal performance.
      *
-     * @see back() for accessing the last element
+     * @warning Calling this function on an empty vector in release mode guarantees undefined
+     * behavior. Always check `empty()` beforehand if the container's operational state is
+     * uncertain.
+     *
+     * @see front() for accessing the first element of the vector
      */
-    [[nodiscard]] constexpr auto front() const noexcept -> const_reference
+    [[nodiscard]] constexpr auto back(this auto&& self) noexcept -> decltype(auto)
     {
-        return data_[0];
-    }
-
-    /**
-     * @brief Unchecked access to the last element
-     *
-     * Returns a reference to the last element (at index size()-1). Provides maximum efficiency
-     * for accessing the rear element. Behavior is undefined if the vector is empty.
-     *
-     * @return A reference to the last element of the vector.
-     *
-     * @complexity \f$ O(1) \f$
-     * @exception noexcept
-     *
-     * @pre The vector must not be empty (size() > 0)
-     *
-     * @warning Calling this function on an empty vector results in undefined behavior.
-     *          Use empty() to check before calling, or use rbegin() + bounds checking.
-     *
-     * @see front() for accessing the first element
-     */
-    [[nodiscard]] constexpr auto back() noexcept -> reference
-    {
-        return data_[size_ - 1];
-    }
-
-    /**
-     * @brief Unchecked const access to the last element
-     *
-     * Const version of back(). Returns a const reference to the last element.
-     * Behavior is undefined if the vector is empty.
-     *
-     * @return A const reference to the last element of the vector.
-     *
-     * @complexity \f$ O(1) \f$
-     * @exception noexcept
-     *
-     * @pre The vector must not be empty (size() > 0)
-     *
-     * @warning Calling this function on an empty vector results in undefined behavior.
-     *          Use empty() to check before calling, or use rbegin() + bounds checking
-     *
-     * @see front() for accessing the first element
-     */
-    [[nodiscard]] constexpr auto back() const noexcept -> const_reference
-    {
-        return data_[size_ - 1];
+        assert(self.size_ > 0 && "forge::vector::back() called on empty vector!");
+        return self.data_[self.size_ - 1];
     }
 
     /**
      * @brief Provides direct pointer access to the underlying data array
      *
-     * Returns a pointer to the first element of the underlying array. This allows direct pointer
-     * manipulation and compatibility with C-style APIs expecting pointer arguments. Be careful not
-     * to access elements beyond [data_, data_+size()).
+     * Returns a pointer to the first element of the underlying array, allowing direct pointer
+     * manipulation and out-of-the-box compatibility with C-style APIs. This function leverages
+     * C++23 explicit object parameters ("deducing this") to automatically unify const and
+     * non-const overloads into a single implementation.
      *
-     * @return A pointer to the underlying element array, or nullptr if the vector is empty.
-     *
-     * @complexity \f$ O(1) \f$
-     * @exception noexcept
-     *
-     * @note The returned pointer is valid only as long as no reallocation occurs. Reallocation can
-     *       occur via push_back(), insert(), emplace_back(), resize(), reserve(), or similar.
-     * @note For an empty vector, data() may return nullptr or a valid pointer to no actual
-     * elements. Both behaviors are valid.
-     *
-     * @see get_view() for a safer view via std::span
-     */
-    [[nodiscard]] constexpr auto data() noexcept -> pointer
-    {
-        return data_;
-    }
-
-    /**
-     * @brief Provides const pointer access to the underlying data array
-     *
-     * Const version of data(). Returns a const pointer to the first element, providing read-only
-     * access to the underlying array. This allows C-style read-only pointer operations and use with
-     * C APIs that accept const pointers.
-     *
-     * @return A const pointer to the underlying element array, or nullptr if the vector is empty.
+     * @param self The deduced instance of the vector (handles cv-ref qualifiers automatically).
+     * @return A forwarded pointer to the underlying array (`T*` or `const T*` depending on the
+     * cv-qualification of the calling vector instance). Returns `nullptr` if the vector
+     * has no allocated capacity.
      *
      * @complexity \f$ O(1) \f$
      * @exception noexcept
      *
-     * @note The returned pointer is valid only as long as no reallocation occurs. Reallocation can
-     *       occur via push_back(), insert(), emplace_back(), resize(), reserve(), or similar.
-     * @note For an empty vector, data() may return nullptr or a valid pointer to no actual
-     * elements. Both behaviors are valid.
+     * @note **Pointer Validity:** The returned pointer is strictly valid only as long as no
+     * reallocation occurs. Reallocation can be triggered by operations such as `push_back()`,
+     * `insert()`, `emplace_back()`, `resize()`, `reserve()`, or similar capacity-modifying
+     * functions.
+     * @note For an empty vector with non-zero capacity, `data()` returns a valid pointer to the
+     * allocated buffer but accessing elements remains undefined behavior as `size() == 0`.
      *
-     * @see get_view() for a safer view via std::span
+     * @see get_view() for a safer, modern alternative via std::span
      */
-    [[nodiscard]] constexpr auto data() const noexcept -> const_pointer
+    [[nodiscard]] constexpr auto data(this auto&& self) noexcept -> decltype(self.data_)
     {
-        return data_;
+        return self.data_;
     }
 
     /**
-     * @brief Returns a std::span view of all elements in the vector
+     * @brief Returns a std::span view of all active elements in the vector
      *
-     * Creates a non-owning std::span that views the vector's elements. This provides a safe
-     * alternative to raw pointers, with bounds information included. The span is valid as long as
-     * no reallocation occurs (i.e., no push_back(), insert(), reserve() that increases capacity).
+     * Creates a non-owning `std::span` that acts as a safe, viewable window over the vector's
+     * elements. This function leverages C++23 explicit object parameters ("deducing this") to
+     * automatically unify const and non-const overloads, preserving array boundaries alongside data
+     * access.
      *
-     * @return A std::span<T> viewing [data_, data_+size()).
+     * @param self The deduced instance of the vector (handles cv-ref qualifiers automatically).
+     * @return A `std::span<T>` or `std::span<const T>` (depending on the cv-qualification of the
+     * calling vector instance) viewing the contiguous range `[data(), data() + size())`.
      *
      * @complexity \f$ O(1) \f$
      * @exception noexcept
      *
-     * @note This is a modern replacement for raw pointer access that maintains type and bounds
-     *       information. Particularly useful for passing to functions expecting span parameters.
-     * @note The span is invalidated if any operation causes reallocation. For empty vectors,
-     *       the returned span is valid but empty.
-     * @see std::span for documentation on the span view type
+     * @note This serves as a modern, type-safe replacement for raw pointer manipulation by
+     * encapsulating bounds information directly. It is ideal for passing data to functions
+     * expecting slice or span semantics.
+     * @note The returned span is immediately invalidated if any operation causes an internal vector
+     * reallocation. For completely empty vectors, the returned span is valid but retains a size of
+     * zero.
+     *
+     * @see data() for raw pointer access
+     * @see std::span for C++ standard library span specifications
      */
-    [[nodiscard]] constexpr auto get_view() noexcept -> std::span<T>
+    [[nodiscard]] constexpr auto get_view(this auto&& self) noexcept
     {
-        return std::span<T>(data_, size_);
-    }
-
-    /**
-     * @brief Returns a const std::span view of all elements in the vector
-     *
-     * Creates a non-owning std::span that views the vector's elements. This provides a safe
-     * alternative to raw pointers, with bounds information included. The span is valid as long as
-     * no reallocation occurs (i.e., no push_back(), insert(), reserve() that increases capacity).
-     *
-     * @return A std::span<const T> viewing [data_, data_+size()).
-     *
-     * @complexity \f$ O(1) \f$
-     * @exception noexcept
-     *
-     * @note This is a modern replacement for raw pointer access that maintains type and bounds
-     *       information. Particularly useful for passing to functions expecting span parameters.
-     * @note The span is invalidated if any operation causes reallocation. For empty vectors,
-     *       the returned span is valid but empty.
-     *
-     * @see std::span for documentation on the span view type
-     */
-    [[nodiscard]] constexpr auto get_view() const noexcept -> std::span<const T>
-    {
-        return std::span<const T>(data_,
-                                  size_); // Return a span that views the elements of the vector
-    }
-
-    /**
-     * @brief Checks if the vector contains a specific value
-     *
-     * Searches the vector for an element equal to the provided value. Returns true if found,
-     * false otherwise. Uses operator== for equality comparison.
-     *
-     * @param value The value to search for. Must be equality-comparable with T.
-     * @return true if the vector contains an element equal to value; false otherwise.
-     *
-     * @complexity \f$ O(n) \f$
-     * @exception noexcept
-     *
-     * @see find(const_reference) for retrieving an iterator to the found element
-     */
-    [[nodiscard]] constexpr auto contains(const_reference value) const noexcept -> bool
-    {
-        return std::ranges::find(get_view(), value) != get_view().end();
-    }
-
-    /**
-     * @brief Finds the first occurrence of a specific value and returns an iterator
-     *
-     * Performs a linear search for the first element equal to the provided value.
-     * Returns an iterator to the found element, or end() if not found.
-     *
-     * @param value The value to search for. Must be equality-comparable with T.
-     * @return A const_iterator to the first matching element, or end() if not found.
-     *
-     * @complexity \f$ O(n) \f$
-     * @exception noexcept
-     *
-     * @note For a boolean check, use contains() instead, which is semantically clearer.
-     *
-     * @see contains(const_reference) for just checking existence without an iterator
-     */
-    [[nodiscard]] constexpr auto find(const_reference value) const noexcept -> const_iterator
-    {
-        auto it = std::ranges::find(get_view(), value);
-        if (it != get_view().end())
-        {
-            return iterator(
-                data_ +
-                (it - get_view().begin())); // Return an iterator pointing to the found element
-        }
-        else
-        {
-            return end(); // Return end() if the value is not found
-        }
+        using element_t =
+            std::conditional_t<std::is_const_v<std::remove_reference_t<decltype(self)>>, const T,
+                               T>;
+        return std::span<element_t>(self.data_, self.size_);
     }
 
     /**
@@ -913,7 +808,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @note This allows users to query the allocator for properties, perform custom allocations, or
      *       use allocator-aware utilities. For most users, this is not commonly needed.
      */
-    constexpr auto get_allocator() const noexcept -> allocator_type
+    [[nodiscard]] constexpr auto get_allocator() const noexcept -> allocator_type
     {
         return alloc_;
     }
@@ -926,18 +821,19 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     /**
      * @brief Returns the number of elements currently stored in the vector
      *
-     * Returns the count of actual elements stored, not the allocated capacity.
-     * This is always <= capacity().
+     * Returns the exact count of active elements managed by the container, not the
+     * underlying allocated capacity.
      *
-     * @return The current size (number of stored elements).
+     * @return The current size (number of populated elements).
      *
      * @complexity \f$ O(1) \f$
      * @exception noexcept
      *
-     * @note For checking emptiness, use empty() instead, which is more idiomatic.
+     * @note For validating if a container has zero elements, checking `empty()` is
+     * semantically preferred and more idiomatic.
      *
-     * @see capacity() to get allocated storage
-     * @see empty() for a boolean emptiness check
+     * @see capacity() to query total allocated memory blocks
+     * @see empty() for an explicit boolean emptiness check
      */
     [[nodiscard]] constexpr auto size() const noexcept -> size_type
     {
@@ -947,30 +843,38 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     /**
      * @brief Returns the theoretical maximum number of elements the vector can hold
      *
-     * This represents the largest possible size the vector could reach, accounting for both
-     * allocator limits and the maximum value representable by size_type. In practice, memory
-     * availability is usually the limiting factor before reaching this value.
+     * Calculates the system and allocator-imposed upper boundary for the container's size.
+     * This accounts for allocator limits, the maximum value representable by `size_type`,
+     * and pointer arithmetic distance limitations (`difference_type`).
      *
      * @return The maximum possible size the vector can achieve.
      *
      * @complexity \f$ O(1) \f$
      * @exception noexcept
      *
-     * @note This value is typically very large (billions of elements) and is not a practical limit
-     *       in most applications. Actual allocation limits come from available memory.
-     * @note Calculated as min(allocator::max_size(), std::numeric_limits<difference_type>::max())
-     *       to ensure all pointer arithmetic remains valid.
+     * @note Hardened to ensure that `max_size() * sizeof(value_type)` can never overflow
+     * pointer arithmetic boundaries, keeping all iterator offsets entirely safe from undefined
+     * behavior.
      *
      * @see capacity() for the currently allocated size
      * @see size() for the number of elements currently stored
      */
     [[nodiscard]] constexpr auto max_size() const noexcept -> size_type
     {
-        // Use difference_type as the distance between pointers must be representable by a signed
-        // integer, not unsigned
-        return std::min<size_type>(traits::max_size(alloc_),
-                                   std::numeric_limits<difference_type>::max() /
-                                       sizeof(value_type));
+        // 1. Absolute maximum elements allowed by the pointer distance model (signed limit)
+        const auto pointer_dist_limit =
+            static_cast<size_type>(std::numeric_limits<difference_type>::max());
+
+        // 2. Absolute maximum elements allowed by physical addressing limits (unsigned limit /
+        // element size)
+        const size_type allocation_limit =
+            std::numeric_limits<size_type>::max() / sizeof(value_type);
+
+        // 3. Combine them to find the true structural hardware limit
+        const size_type hardware_limit = std::min(pointer_dist_limit, allocation_limit);
+
+        // 4. Return the stricter of the allocator's internal limit and the system hardware limit
+        return std::min(traits::max_size(alloc_), hardware_limit);
     }
 
     /**
@@ -1015,23 +919,33 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     /**
      * @brief Returns the total bytes of memory allocated for the element storage
      *
-     * Calculates and returns the number of bytes used for the internal buffer, equal to
-     * capacity() * sizeof(T). Useful for memory profiling and debugging. Does not include
-     * overhead from the vector structure itself or the allocator.
+     * Calculates and returns the memory footprint of the container in bytes. By default,
+     * it measures the raw heap allocation buffer (`capacity() * sizeof(T)`). It can optionally
+     * include the stack overhead of the vector's control block itself for precise tracking.
      *
-     * @return Total bytes allocated for elements: capacity() * sizeof(T).
+     * @param include_control_block If true, adds `sizeof(*this)` to include the stack overhead
+     * of the vector object structures (pointers, size tracker, etc.).
+     * @return Total bytes allocated/consumed by the vector.
      *
      * @complexity \f$ O(1) \f$
      * @exception noexcept
      *
-     * @note This is the raw allocated memory, not accounting for any allocator overhead,
-     *       vector object overhead, or fragmentation.
+     * @note This reflects calculated structural memory allocations. It cannot account for
+     * external allocator padding, heap-manager tracking cookies, or internal fragmentation.
      *
-     * @see capacity() for the number of elements that can fit
+     * @see capacity() for the number of elements currently accommodated in the buffer
      */
-    [[nodiscard]] constexpr auto memory_usage() const noexcept -> size_type
+    [[nodiscard]] constexpr auto
+    memory_usage(bool include_control_block = false) const noexcept -> size_type
     {
-        return capacity_ * sizeof(value_type);
+        const size_type heap_bytes = capacity_ * sizeof(value_type);
+
+        if (include_control_block)
+        {
+            return heap_bytes + sizeof(*this);
+        }
+
+        return heap_bytes;
     }
 
     /**
@@ -1060,38 +974,31 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     constexpr auto reserve(size_type new_capacity) -> void
     {
         if (new_capacity > max_size()) [[unlikely]]
-            throw std::length_error("vector::reserve: capacity exceeded max_size()");
+            throw std::length_error(
+                "forge::vector::reserve: requested capacity exceeds max_size()");
+
         if (new_capacity > capacity_)
         {
             pointer new_data = traits::allocate(alloc_, new_capacity);
 
-            size_type i = 0;
             try
             {
-                for (; i < size_; ++i)
-                {
-                    traits::construct(alloc_, new_data + i, std::move_if_noexcept(data_[i]));
-                }
+                relocate_elements(new_data);
             }
             catch (...)
             {
-                // Clean up new buffer
-                for (size_type j = 0; j < i; ++j)
-                {
-                    traits::destroy(alloc_, new_data + j);
-                }
                 traits::deallocate(alloc_, new_data, new_capacity);
-
-                throw; // Rethrow the exception to propagate it to the caller
+                throw;
             }
 
             if (data_)
             {
-                for (size_type j = 0; j < size_; ++j)
+                if constexpr (!detail::trivially_manipulable_v<value_type, Alloc>)
                 {
-                    traits::destroy(alloc_, data_ + j);
+                    for (size_type j = 0; j < size_; ++j)
+                        traits::destroy(alloc_, data_ + j);
                 }
-                traits::deallocate(alloc_, data_, capacity_); // Deallocate old memory
+                traits::deallocate(alloc_, data_, capacity_);
             }
 
             capacity_ = new_capacity;
@@ -1119,6 +1026,9 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      */
     constexpr auto shrink_to_fit() -> void
     {
+        if (capacity_ == size_)
+            return; // No excess capacity to free, so we can skip the entire process.
+
         // Create a temporary vector that is exactly the size of our current elements.
         // The copy constructor (or move-based constructor) will only allocate
         // as much as it needs.
@@ -1219,11 +1129,15 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     constexpr auto emplace_back(Args&&... args) -> reference
         requires std::constructible_from<T, Args...>
     {
-        if (size_ >= capacity_)
-            reallocate();
-
-        traits::construct(alloc_, data_ + size_, std::forward<Args>(args)...);
-        return data_[size_++];
+        if (size_ < capacity_)
+        {
+            traits::construct(alloc_, data_ + size_, std::forward<Args>(args)...);
+            return data_[size_++];
+        }
+        // Reallocation path: delegate to a helper that constructs the new element
+        // into the new buffer *before* the old buffer is released, making
+        // self-insertion (e.g. vec.emplace_back(vec[0])) well-defined.
+        return emplace_back_realloc(std::forward<Args>(args)...);
     }
 
     /**
@@ -1314,119 +1228,32 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     constexpr auto insert(const_iterator pos, size_type count, const_reference value) -> iterator
         requires std::copy_constructible<T>
     {
-        size_type offset = pos - cbegin();
-
-        if (count == 0)
-            return iterator(data_ + offset);
-
-        if (size_ + count > max_size()) [[unlikely]]
-            throw std::length_error("vector::insert: size exceeds max_size()");
-
-        size_type index = pos - cbegin();
-
-        if (size_ + count > capacity_)
-        {
-            // Reallocation needed
-
-            // New capacity is either the current size plus count (to fit new elements) or 1.5x the
-            // current capacity, whichever is larger
-            size_type new_capacity = std::max(size_ + count, capacity_ + capacity_ / 2);
-            vector temp(alloc_);
-            temp.reserve(new_capacity);
-
-            // Move elements before the insertion point
-            for (size_type i = 0; i < index; ++i)
+        const T value_copy(value);
+        return insert_n(
+            pos, count, [&](pointer dst) { construct_fill(dst, count, value_copy); },
+            [&](vector& temp)
             {
-                temp.push_back(std::move_if_noexcept(data_[i]));
-            }
-
-            // Insert the new elements
-            for (size_type i = 0; i < count; ++i)
-            {
-                temp.emplace_back(value);
-            }
-
-            // Move elements after the insertion point
-            for (size_type i = index; i < size_; ++i)
-            {
-                temp.push_back(std::move_if_noexcept(data_[i]));
-            }
-
-            this->swap(
-                temp); // Swap with the temporary vector, which now has the new elements in place
-            return iterator(
-                data_ + index); // Return an iterator to the first of the newly inserted elements
-        }
-        else
-        {
-            // No reallocation needed, just shift elements in place
-            size_type elements_moved = 0;
-            try
-            {
-                // Move elements from the end to the right to make space for the new elements
-                for (size_type i = size_; i > index; --i)
-                {
-                    traits::construct(alloc_, data_ + i + count - 1,
-                                      std::move_if_noexcept(data_[i - 1]));
-                    elements_moved++;
-                    traits::destroy(alloc_, data_ + i - 1); // Destroy the old element after moving
-                }
-
-                // Insert the new elements in the vacated space
-                size_type elements_inserted = 0;
-                try
-                {
-                    for (; elements_inserted < count; ++elements_inserted)
-                    {
-                        traits::construct(alloc_, data_ + index + elements_inserted, value);
-                    }
-                }
-                catch (...)
-                {
-                    // If construction of new elements fails, we need to roll back the inserted
-                    // elements
-                    for (size_type j = 0; j < elements_inserted; ++j)
-                    {
-                        traits::destroy(alloc_, data_ + index + j);
-                    }
-
-                    // Move the shifted elements back to their original positions
-                    for (size_type j = 0; j < elements_moved; ++j)
-                    {
-                        traits::construct(alloc_, data_ + index + j,
-                                          std::move_if_noexcept(data_[index + count + j]));
-                        traits::destroy(alloc_, data_ + index + count + j);
-                    }
-
-                    elements_moved = 0;
-
-                    throw; // Rethrow the exception to propagate it to the caller
-                }
-            }
-            catch (...)
-            {
-                // If moving elements fails, we need to roll back any moved elements
-                for (size_type j = 0; j < elements_moved; ++j)
-                {
-                    traits::construct(alloc_, data_ + index + j,
-                                      std::move_if_noexcept(data_[index + count + j]));
-                    traits::destroy(alloc_, data_ + index + count + j);
-                }
-                throw;
-            }
-
-            size_ += count; // Update size after successful insertion
-            return iterator(
-                data_ + index); // Return an iterator to the first of the newly inserted elements
-        }
+                for (size_type i = 0; i < count; ++i)
+                    temp.emplace_back(value_copy);
+            });
     }
 
     /**
      * @brief Inserts a range of elements at the specified position
      *
-     * Inserts elements from the range [first, last) at the position indicated by `pos`. Elements at
-     * and after `pos` are shifted to the right to make space for the new elements. If the vector is
-     * at capacity, reallocation occurs automatically.
+     * Inserts elements from the range [first, last) at the position indicated by `pos`.
+     *
+     * Two strategies are used depending on InputIt's capabilities:
+     *  - If InputIt is at least a forward_iterator, the distance is computed up front
+     *    and the work is delegated to the same insert_n() helper used by
+     *    insert(pos, count, value) — shifting the tail and constructing the new
+     *    elements directly into the vacated gap, with a memmove-equivalent fast path
+     *    for trivially copyable T outside constant evaluation.
+     *  - If InputIt is only a single-pass input_iterator, neither the distance nor a
+     *    second traversal is available, so the new elements are instead appended one
+     *    at a time to the end of the vector via emplace_back (consuming the iterator
+     *    exactly once), and the resulting tail block is then moved into position `pos`
+     *    via std::rotate.
      *
      * @param pos A const_iterator indicating the position to insert before. Must be a valid
      * iterator into this vector.
@@ -1437,14 +1264,27 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @return An iterator pointing to the first of the newly inserted elements or `pos` if the
      * range is empty.
      *
-     * @complexity \f$ O(\mbox{size} + \mbox{distance(first, last)}) \f$
+     * @complexity
+     * - Forward-or-better InputIt: O(size + distance(first, last)), matching insert_n.
+     * - Single-pass InputIt: O(size + distance(first, last)) amortized for the
+     *   emplace_back phase, plus an additional O(size + distance(first, last)) for
+     *   the final std::rotate — a larger constant factor than the forward-iterator
+     *   path since rotate is a more general (swap-based) operation than a directional
+     *   shift.
      *
      * @exception std::length_error if size() + distance(first, last) exceeds max_size()
      * @exception std::bad_alloc if reallocation needed but allocation fails
      * @exception ... Any exception thrown by T's copy/move constructor during shifting or
      * construction
      *
-     * @exception_safety Strong exception safety: if insertion fails, the vector is unchanged.
+     * @exception_safety
+     * - Forward-or-better InputIt: Strong — if insertion fails, the vector is unchanged.
+     * - Single-pass InputIt: Strong for failures during the append phase (any
+     *   newly-appended elements are popped back off before the exception propagates,
+     *   restoring the original size and contents exactly). Only the basic guarantee
+     *   (valid, but unspecified, contents and order) if std::rotate itself throws —
+     *   possible only when T's move construction/assignment can throw. This matches
+     *   the documented behavior of std::vector's own InputIt-range insert overload.
      *
      * @note Invalidates iterators at and after `pos` and all pointers if reallocation occurs.
      */
@@ -1453,102 +1293,48 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
         requires std::input_iterator<InputIt> &&
                  std::constructible_from<T, typename std::iterator_traits<InputIt>::reference>
     {
-        size_type count = std::distance(first, last);
-        if (count == 0)
-            return iterator(data_ + (pos - cbegin()));
-
-        if (size_ + count > max_size()) [[unlikely]]
-            throw std::length_error("vector::insert: size exceeds max_size()");
-
         size_type index = pos - cbegin();
 
-        if (size_ + count > capacity_)
+        if constexpr (std::forward_iterator<InputIt>)
         {
-            // Reallocation needed
-
-            // New capacity is either the current size plus count (to fit new elements) or 1.5x the
-            // current capacity, whichever is larger
-            size_type new_capacity = std::max(size_ + count, capacity_ + capacity_ / 2);
-            vector temp(alloc_);
-            temp.reserve(new_capacity);
-
-            // Move elements before the insertion point
-            for (size_type i = 0; i < index; ++i)
-            {
-                temp.push_back(std::move_if_noexcept(data_[i]));
-            }
-
-            // Insert the new elements
-            for (InputIt it = first; it != last; ++it)
-            {
-                temp.emplace_back(*it);
-            }
-
-            // Move elements after the insertion point
-            for (size_type i = index; i < size_; ++i)
-            {
-                temp.push_back(std::move_if_noexcept(data_[i]));
-            }
-
-            this->swap(
-                temp); // Swap with the temporary vector, which now has the new elements in place
-            return iterator(
-                data_ + index); // Return an iterator to the first of the newly inserted elements
+            auto count = static_cast<size_type>(std::distance(first, last));
+            return insert_n(
+                pos, count, [&](pointer dst) { copy_construct_range(dst, first, count); },
+                [&](vector& temp)
+                {
+                    for (InputIt it = first; it != last; ++it)
+                        temp.emplace_back(*it);
+                });
         }
         else
         {
-            // No reallocation needed, just shift elements in place
-            size_type elements_moved = 0;
+            size_type old_size = size_;
+
             try
             {
-                // Move elements from the end to the right to make space for the new elements
-                for (size_type i = size_; i > index; --i)
+                for (; first != last; ++first)
                 {
-                    traits::construct(alloc_, data_ + i + count - 1,
-                                      std::move_if_noexcept(data_[i - 1]));
-                    elements_moved++;
-                    traits::destroy(alloc_, data_ + i - 1); // Destroy the old element after moving
-                }
-
-                // Insert the new elements in the vacated space
-                size_type elements_inserted = 0;
-                try
-                {
-                    for (InputIt it = first; it != last; ++it, ++elements_inserted)
-                    {
-                        traits::construct(alloc_, data_ + index + elements_inserted, *it);
-                    }
-                }
-                catch (...)
-                {
-                    // If construction of new elements fails, we need to roll back the inserted
-                    // elements
-                    for (size_type j = 0; j < elements_inserted; ++j)
-                    {
-                        traits::destroy(alloc_, data_ + index + j);
-                    }
-                    throw;
+                    emplace_back(*first);
                 }
             }
             catch (...)
             {
-                // If shifting fails, we must restore the original elements that were
-                // moved-to the right. For each moved element we previously constructed at
-                // `data_ + index + count + j`, move it back into `data_ + index + j`
-                // and destroy the temporary at the moved-to slot. This ensures the
-                // original elements are reconstructed.
-                for (size_type j = 0; j < elements_moved; ++j)
+                // Restore strong guarantee for this phase: undo every element
+                // appended so far. Original prefix [0, old_size) was never touched.
+                while (size_ > old_size)
                 {
-                    traits::construct(alloc_, data_ + index + j,
-                                      std::move_if_noexcept(data_[index + count + j]));
-                    traits::destroy(alloc_, data_ + index + count + j);
+                    pop_back();
                 }
                 throw;
             }
 
-            size_ += count; // Update size after successful insertion
-            return iterator(
-                data_ + index); // Return an iterator to the first of the newly inserted elements
+            // Move the newly appended block [old_size, size_) into position right
+            // after `index`. `index` is still valid here even if reallocation
+            // occurred during the loop above, since it's a stored offset, not a
+            // pointer, and relative element order below old_size is unchanged.
+            std::rotate(data_ + index, data_ + old_size, data_ + size_);
+
+            return iterator(data_ + index);
         }
     }
 
@@ -1616,69 +1402,10 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      */
     template <class... Args> constexpr auto emplace(const_iterator pos, Args&&... args) -> iterator
     {
-        size_type index = pos - cbegin();
-
-        if (size_ + 1 > max_size()) [[unlikely]]
-            throw std::length_error("vector::emplace: size exceeds max_size()");
-
-        if (size_ >= capacity_)
-        {
-            // Reallocation needed
-            size_type new_capacity = std::max(size_ + 1, capacity_ + capacity_ / 2);
-            vector temp(alloc_);
-            temp.reserve(new_capacity);
-
-            // Move elements before the insertion point
-            for (size_type i = 0; i < index; ++i)
-            {
-                temp.push_back(std::move_if_noexcept(data_[i]));
-            }
-
-            // Construct the new element in place
-            temp.emplace_back(std::forward<Args>(args)...);
-
-            // Move elements after the insertion point
-            for (size_type i = index; i < size_; ++i)
-            {
-                temp.push_back(std::move_if_noexcept(data_[i]));
-            }
-
-            this->swap(
-                temp); // Swap with the temporary vector, which now has the new element in place
-        }
-        else
-        {
-            // No reallocation needed, just shift elements in place and construct the new element
-            size_type elements_moved = 0;
-            try
-            {
-                // Move elements from the end to the right to make space for the new element
-                for (size_type i = size_; i > index; --i)
-                {
-                    traits::construct(alloc_, data_ + i, std::move_if_noexcept(data_[i - 1]));
-                    elements_moved++;
-                    traits::destroy(alloc_, data_ + i - 1); // Destroy the old element after moving
-                }
-
-                // Construct the new element in place at the vacated position
-                traits::construct(alloc_, data_ + index, std::forward<Args>(args)...);
-            }
-            catch (...)
-            {
-                // If construction of the new element fails, we need to roll back any moved elements
-                for (size_type j = 0; j < elements_moved; ++j)
-                {
-                    traits::construct(alloc_, data_ + index + j,
-                                      std::move_if_noexcept(data_[index + j]));
-                    traits::destroy(alloc_, data_ + index + j);
-                }
-                throw; // Rethrow the exception to propagate it to the caller
-            }
-
-            ++size_; // Update size after successful insertion
-        }
-
-        return iterator(data_ + index); // Return an iterator to the newly constructed element
+        return insert_n(
+            pos, 1,
+            [&](pointer dst) { traits::construct(alloc_, dst, std::forward<Args>(args)...); },
+            [&](vector& temp) { temp.emplace_back(std::forward<Args>(args)...); });
     }
 
     /**
@@ -1699,10 +1426,12 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      */
     constexpr auto pop_back() noexcept -> void
     {
-        if (size_ > 0)
+        if (size_ > 0) [[likely]]
         {
             --size_;
-            traits::destroy(alloc_, data_ + size_);
+
+            if constexpr (!detail::trivially_destructible_v<value_type, Alloc>)
+                traits::destroy(alloc_, data_ + size_);
         }
     }
 
@@ -1727,10 +1456,25 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @note Invalidates iterators at and after `pos` and all pointers to elements after `pos`.
      * @see erase(const_iterator, const_iterator) to remove a range of elements
      */
-    constexpr auto erase(const_iterator pos) noexcept(std::is_nothrow_move_assignable_v<value_type>) -> iterator
+    constexpr auto
+    erase(const_iterator pos) noexcept(std::is_nothrow_move_assignable_v<value_type>) -> iterator
     {
         // Calculate raw index
         size_type index = pos - cbegin();
+        assert(index < size_ && "forge::vector::erase: iterator is out of range");
+
+        if constexpr (detail::trivially_manipulable_v<value_type, Alloc>)
+        {
+            // For trivially manipulable types, we can use memmove to shift the tail in one go.
+            if !consteval
+            {
+                std::memmove(static_cast<void*>(data_ + index),
+                             static_cast<const void*>(data_ + index + 1),
+                             (size_ - index - 1) * sizeof(value_type));
+                --size_;
+                return iterator(data_ + index);
+            }
+        }
 
         // Shift elements after the removed element to the left
         for (size_type i = index + 1; i < size_; ++i)
@@ -1741,7 +1485,8 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
         // Shrink the vector by one element and destroy the last element which is now a
         // duplicate/moved-from object after the shift
         --size_;
-        traits::destroy(alloc_, data_ + size_);
+        if constexpr (!detail::trivially_destructible_v<value_type, Alloc>)
+            traits::destroy(alloc_, data_ + size_);
 
         // Return an iterator pointing to the element that followed the removed element, or end() if
         // it was the last one
@@ -1771,7 +1516,9 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @note Invalidates iterators at and after `first` and all pointers to elements after `first`.
      * @see erase(const_iterator) to remove a single element
      */
-    constexpr auto erase(const_iterator first, const_iterator last) noexcept(std::is_nothrow_move_assignable_v<value_type>) -> iterator
+    constexpr auto
+    erase(const_iterator first,
+          const_iterator last) noexcept(std::is_nothrow_move_assignable_v<value_type>) -> iterator
     {
         size_type index_first = first - cbegin();
 
@@ -1781,22 +1528,32 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
         size_type index_last = last - cbegin();
         size_type count = index_last - index_first;
 
-        // Shift elements after the removed range to the left
+        if constexpr (detail::trivially_manipulable_v<T, Alloc>)
+        {
+            if !consteval
+            {
+                std::memmove(static_cast<void*>(data_ + index_first),
+                             static_cast<const void*>(data_ + index_last),
+                             (size_ - index_last) * sizeof(T));
+                size_ -= count;
+                return iterator(data_ + index_first);
+            }
+        }
+
         for (size_type i = index_last; i < size_; ++i)
         {
             data_[i - count] = std::move_if_noexcept(data_[i]);
         }
 
-        // Shrink the vector by the number of removed elements and destroy the now-unused elements
-        // at the end
         size_ -= count;
-        for (size_type i = size_; i < size_ + count; ++i)
+        if constexpr (!detail::trivially_destructible_v<value_type, Alloc>)
         {
-            traits::destroy(alloc_, data_ + i);
+            for (size_type i = size_; i < size_ + count; ++i)
+            {
+                traits::destroy(alloc_, data_ + i);
+            }
         }
 
-        // Return an iterator pointing to the element that followed the removed range, or end() if
-        // it was the last one
         return iterator(data_ + index_first);
     }
 
@@ -1829,16 +1586,11 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     constexpr auto resize(size_type new_size) -> void
     {
         if (new_size > max_size()) [[unlikely]]
-            throw std::length_error("vector::resize: new size exceeds max_size()");
+            throw std::length_error("forge::vector::resize: new size exceeds max_size()");
 
         if (new_size < size_)
         {
-            // Shrink the vector by destroying elements from new size to old size
-            while (size_ > new_size)
-            {
-                --size_;
-                traits::destroy(alloc_, data_ + size_);
-            }
+            truncate_to(new_size);
         }
         else if (new_size > size_)
         {
@@ -1848,26 +1600,9 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
                 reserve(new_size);
             }
 
-            size_type original_size = size_;
-            try
-            {
-                while (size_ < new_size)
-                {
-                    traits::construct(alloc_, data_ + size_);
-                    ++size_; // Only increment after a successful construction
-                }
-            }
-            catch (...)
-            {
-                // Destroy any newly constructed elements
-                while (size_ > original_size)
-                {
-                    --size_;
-                    traits::destroy(alloc_, data_ + size_);
-                }
-
-                throw; // Rethrow the exception to propagate it to the caller
-            }
+            size_type count = new_size - size_;
+            construct_fill_default(count);
+            size_ = new_size;
         }
     }
 
@@ -1899,45 +1634,26 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     constexpr auto resize(size_type new_size, const_reference value) -> void
     {
         if (new_size > max_size()) [[unlikely]]
-            throw std::length_error("vector::resize: new size exceeds max_size()");
+            throw std::length_error("forge::vector::resize: new size exceeds max_size()");
 
         if (new_size < size_)
         {
-            // Shrink the vector by destroying elements from new size to old size
-            while (size_ > new_size)
-            {
-                --size_;
-                traits::destroy(alloc_, data_ + size_);
-            }
+            truncate_to(new_size);
         }
         else if (new_size > size_)
         {
-            // Grow the vector, first ensure we have enough capacity for the new size
+            // Copy `value` before reserve() in case `value` aliases an element
+            // in the current buffer that would be freed/moved by the reallocation.
+            const value_type fill_val(value);
+
             if (new_size > capacity_)
             {
                 reserve(new_size);
             }
 
-            size_type original_size = size_;
-            try
-            {
-                while (size_ < new_size)
-                {
-                    traits::construct(alloc_, data_ + size_, value);
-                    ++size_; // Only increment after a successful construction
-                }
-            }
-            catch (...)
-            {
-                // Destroy any newly constructed elements
-                while (size_ > original_size)
-                {
-                    --size_;
-                    traits::destroy(alloc_, data_ + size_);
-                }
-
-                throw; // Rethrow the exception to propagate it to the caller
-            }
+            size_type count = new_size - size_;
+            construct_fill(data_ + size_, count, fill_val);
+            size_ = new_size;
         }
     }
 
@@ -1947,7 +1663,8 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * Destroys all contained elements by calling their destructors and sets size to zero.
      * After this operation, the vector is empty but has not released its allocated buffer.
      *
-     * @complexity \f$ O(\mbox{size}) \f$
+     * @complexity \f$ O(\mbox{size}) \f$ for non-trivially destructible types; \f$ O(1) \f$
+     * for trivially destructible types.
      * @exception noexcept
      *
      * @note This is a very efficient way to empty a vector while keeping its allocated capacity
@@ -1960,11 +1677,7 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      */
     constexpr auto clear() noexcept -> void
     {
-        while (size_ > 0)
-        {
-            --size_;
-            traits::destroy(alloc_, data_ + size_);
-        }
+        truncate_to(0);
     }
 
     /**
@@ -2057,28 +1770,101 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     /**
      * @brief Exchanges the contents of this vector with another vector
      *
-     * Efficiently swaps all internal state between two vectors: allocator, data pointer, size, and
-     * capacity. After swap, the contents of this vector become those of `other`, and vice versa.
+     * Efficiently swaps all internal state between two vectors: data pointer, size, and capacity.
+     * The allocator is swapped only when `propagate_on_container_swap` is true; otherwise the
+     * allocators must be equal and only the buffer pointers are exchanged.
+     * After swap, the contents of this vector become those of `other`, and vice versa.
      *
      * @param other The other vector to swap with. Must be the same type and allocator.
      *
      * @complexity \f$ O(1) \f$
-     * @exception noexcept(std::is_nothrow_swappable_v<Alloc>)
+     * @exception noexcept if `propagate_on_container_swap` is false (pointer swaps only) or
+     *            if `propagate_on_container_swap` is true and Alloc is nothrow-swappable.
      *
-     * @note Iterators remain valid but point to the other vector's elements (if iterators are
-     *       saved, they now refer to elements that belonged to the other vector).
+     * @note If `propagate_on_container_swap::value` is `false` and the two allocators are not
+     *       equal, calling swap() is undefined behavior. A debug assertion is provided to catch
+     * this in non-release builds.
+     * @note Iterators remain valid but now refer to elements in the other vector.
      * @note This is the underlying operation used by copy-and-swap idiom for exception safety.
-     * @note Allocators are swapped (not copied), so allocator ownership is transferred.
      *
      * @see non-member swap(vector&, vector&) for the standard free function
      */
-    constexpr auto swap(vector& other) noexcept(std::is_nothrow_swappable_v<Alloc>) -> void
+    constexpr auto swap(vector& other) noexcept(!traits::propagate_on_container_swap::value ||
+                                                std::is_nothrow_swappable_v<Alloc>) -> void
     {
         using std::swap;
-        swap(alloc_, other.alloc_);
+        if constexpr (traits::propagate_on_container_swap::value)
+        {
+            swap(alloc_, other.alloc_);
+        }
+        else
+        {
+            // if POCS is false and allocators differ, swap is UB.
+            assert(alloc_ == other.alloc_ && "forge::vector::swap: UB - allocators are unequal and "
+                                             "propagate_on_container_swap is false");
+        }
         swap(data_, other.data_);
         swap(size_, other.size_);
         swap(capacity_, other.capacity_);
+    }
+
+  public:
+    // =========================================================
+    // Lookup
+    // =========================================================
+
+    /**
+     * @brief Checks if the vector contains a specific value
+     *
+     * Searches the vector for an element equal to the provided value. Returns true if found,
+     * false otherwise. Uses operator== for equality comparison.
+     *
+     * @tparam U The type of the value to search for. Must be equality-comparable with T.
+     * @param value The value to search for.
+     * @return true if the vector contains an element equal to value; false otherwise.
+     *
+     * @complexity \f$ O(n) \f$
+     * @exception noexcept if the comparison between T and U is noexcept.
+     *
+     * @see find(const_reference) for retrieving an iterator to the found element
+     */
+    template <typename U = T>
+        requires std::equality_comparable_with<T, U>
+    [[nodiscard]] constexpr auto contains(const U& value) const
+        noexcept(noexcept(std::declval<const T&>() == value)) -> bool
+    {
+        return std::ranges::find(data_, data_ + size_, value) != (data_ + size_);
+    }
+
+    /**
+     * @brief Finds the first occurrence of a specific value and returns an iterator
+     *
+     * Performs a linear search for the first element equal to the provided value.
+     *
+     * @tparam U The type of the value to search for. Must be equality-comparable with T.
+     * @param self The deduced instance of the vector (handles cv-ref qualifiers automatically).
+     * @param value The value to search for.
+     * @return An iterator to the first matching element, or end() if not found. The iterator
+     * type matches the constness of the calling vector.
+     *
+     * @complexity \f$ O(n) \f$
+     * @exception noexcept if the comparison between T and U is noexcept.
+     *
+     * @see contains(const_reference) for just checking existence without an iterator
+     */
+    template <typename U = T>
+        requires std::equality_comparable_with<T, U>
+    [[nodiscard]] constexpr auto find(this auto&& self, const_reference value) noexcept(
+        noexcept(std::declval<const T&>() == value)) -> decltype(auto)
+    {
+        auto* ptr = std::ranges::find(self.data_, self.data_ + self.size_, value);
+
+        using iterator_type =
+            std::conditional_t<std::is_const_v<std::remove_reference_t<decltype(self)>>,
+                               typename std::remove_reference_t<decltype(self)>::const_iterator,
+                               typename std::remove_reference_t<decltype(self)>::iterator>;
+
+        return iterator_type(ptr);
     }
 
   public:
@@ -2197,42 +1983,16 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
          * @brief Accesses a member of the pointed-to element via the arrow operator
          *
          * Equivalent to (*it).member, allowing direct member access syntax. Useful when iterating
-         * over containers of complex objects.
+         * over containers of complex objects. The `const` qualifier here applies to the iterator
+         * itself, not the element - `pointer` for a mutable `base_iterator<T>` is `T*`, which
+         * still allows modification of the element.
          *
-         * @return A pointer to the element, for member access.
-         *
-         * @complexity \f$ O(1) \f$
-         * @exception noexcept
-         *
-         * @pre The iterator must be valid and dereferenceable (not past-the-end).
-         * @pre The element must have accessible members (not a primitive type).
-         *
-         * @example
-         * @code
-         * for (auto it = vec.begin(); it != vec.end(); ++it)
-         *     it->member = value;  // Uses operator->()
-         * @endcode
-         *
-         * @see operator*() for dereferencing
-         */
-        constexpr auto operator->() noexcept -> pointer
-        {
-            return ptr_;
-        }
-
-        /**
-         * @brief Accesses a member of the pointed-to element via the arrow operator (const version)
-         *
-         * Equivalent to (*it).member, allowing direct member access syntax. Useful when iterating
-         * over containers of complex objects.
-         *
-         * @return A pointer to the element, for member access.
+         * @return A pointer to the element for member access.
          *
          * @complexity \f$ O(1) \f$
          * @exception noexcept
          *
          * @pre The iterator must be valid and dereferenceable (not past-the-end).
-         * @pre The element must have accessible members (not a primitive type).
          *
          * @example
          * @code
@@ -2534,11 +2294,12 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     /**
      * @brief Returns an iterator to the first element
      *
-     * Returns an iterator to the first element in the vector. If the vector is empty, the returned
-     * iterator equals end(). Dereferencing an iterator to an empty vector results in undefined
-     * behavior; check empty() first if unsure.
+     * Returns an iterator (mutable on a non-const vector, const on a const vector) to the first
+     * element. If the vector is empty, the returned iterator equals end().
      *
-     * @return An iterator to the first element (or end() if empty).
+     * @param self The deduced instance of the vector.
+     * @return `iterator` on a non-const vector, `const_iterator` on a const vector.
+     *         Returns end() if the vector is empty.
      *
      * @complexity \f$ O(1) \f$
      * @exception noexcept
@@ -2549,31 +2310,12 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see end() for the past-the-end iterator
      * @see cbegin() for a const version
      */
-    [[nodiscard]] constexpr auto begin() noexcept -> iterator
+    [[nodiscard]] constexpr auto begin(this auto& self) noexcept
     {
-        return iterator(data_);
-    }
+        using it_t = std::conditional_t<std::is_const_v<std::remove_reference_t<decltype(self)>>,
+                                        const_iterator, iterator>;
 
-    /**
-     * @brief Returns a const iterator to the first element
-     *
-     * Returns a const iterator to the first element in the vector. Provides read-only iteration
-     * starting from the beginning. If the vector is empty, returns an iterator equivalent to
-     * cend().
-     *
-     * @return A const iterator to the first element (or cend() if empty).
-     *
-     * @complexity \f$ O(1) \f$
-     * @exception noexcept
-     *
-     * @note Invalidated by any operation that causes reallocation (reserve, push_back, insert,
-     * etc.).
-     *
-     * @see cend() for the corresponding past-the-end iterator
-     */
-    [[nodiscard]] constexpr auto begin() const noexcept -> const_iterator
-    {
-        return const_iterator(data_);
+        return it_t(self.data_);
     }
 
     /**
@@ -2604,10 +2346,10 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * Returns an iterator pointing to the position one past the last valid element. This iterator
      * is used as a sentinel and should not be dereferenced. It is equal to begin() if the vector
-     * is empty. Commonly used as the loop termination condition: for (auto it = v.begin(); it !=
-     * v.end(); ++it)
+     * is empty.
      *
-     * @return An iterator to one past the last element.
+     * @param self The deduced instance of the vector.
+     * @return `iterator` on a non-const vector, `const_iterator` on a const vector.
      *
      * @complexity \f$ O(1) \f$
      * @exception noexcept
@@ -2620,32 +2362,12 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      * @see begin() for the first element iterator
      * @see cend() for the const version
      */
-    [[nodiscard]] constexpr auto end() noexcept -> iterator
+    [[nodiscard]] constexpr auto end(this auto& self) noexcept
     {
-        return iterator(data_ + size_);
-    }
+        using it_t = std::conditional_t<std::is_const_v<std::remove_reference_t<decltype(self)>>,
+                                        const_iterator, iterator>;
 
-    /**
-     * @brief Returns a const iterator to one past the last element
-     *
-     * Returns a const iterator to the end sentinel (one past the last element). Used for
-     * read-only range iteration: for (auto it = v.begin(); it != v.end(); ++it)
-     *
-     * @return A const iterator to one past the last element.
-     *
-     * @complexity \f$ O(1) \f$
-     * @exception noexcept
-     *
-     * @pre Do not dereference the returned iterator.
-     *
-     * @note Invalidated by any operation that causes reallocation (reserve, push_back, insert,
-     * etc.).
-     *
-     * @see cbegin() for the corresponding first element iterator
-     */
-    [[nodiscard]] constexpr auto end() const noexcept -> const_iterator
-    {
-        return const_iterator(data_ + size_);
+        return it_t(self.data_ + self.size_);
     }
 
     /**
@@ -2680,11 +2402,45 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
     // =========================================================
 
     /**
+     * @brief Computes the next capacity using the 1.5x growth strategy
+     *
+     * Calculates the new buffer size to use when the vector must grow, applying a 1.5x
+     * multiplicative factor. Handles the edge case where capacity_ is 0 (returns 1) and
+     * where integer rounding causes `capacity_ + capacity_/2 == capacity_` for small values
+     * (guards by returning `capacity_ + 1` in that case).
+     *
+     * @return The next capacity to allocate.
+     *
+     * @complexity \f$ O(1) \f$
+     * @exception std::length_error if the computed capacity exceeds max_size()
+     *
+     * @note The 1.5x growth factor strikes a balance between avoiding frequent reallocations
+     *       and excessive memory waste compared to a 2x factor.
+     *
+     * @see reallocate() which uses this helper
+     * @see emplace_back_realloc() which uses this helper
+     */
+    [[nodiscard]] constexpr auto compute_next_capacity() const -> size_type
+    {
+        size_type new_cap = (capacity_ == 0) ? 1 : capacity_ + capacity_ / 2;
+
+        // Guard against integer rounding: for capacity_ == 1, capacity_ + capacity_/2 == 1
+        // (no growth). Bump to capacity_ + 1 so we always make forward progress.
+        if (new_cap <= capacity_)
+            new_cap = capacity_ + 1;
+
+        if (new_cap > max_size()) [[unlikely]]
+            throw std::length_error("forge::vector: size exceeds max_size()");
+
+        return new_cap;
+    }
+
+    /**
      * @brief Reallocates the internal buffer using 1.5x growth factor
      *
-     * Internal helper function called when the vector needs more capacity. Calculates a new
-     * capacity using a 1.5x growth strategy (capacity = 0 ? 1 : capacity * 1.5), then delegates
-     * to reserve(new_capacity) to perform the actual reallocation and move.
+     * Internal helper called when the vector needs more capacity in contexts that do NOT
+     * require self-insertion safety (e.g. operations that have already materialized their
+     * values). Delegates to `reserve(compute_next_capacity())`.
      *
      * @complexity \f$ O(\mbox{size}) \f$
      *
@@ -2694,29 +2450,457 @@ template <typename T, typename Alloc = std::allocator<T>> class vector
      *
      * @exception_safety Strong: on exception, vector is unchanged
      *
-     * @note This function is called automatically by push_back(), emplace_back(), and similar
-     *       operations when capacity is exceeded.
-     * @note The 1.5x strategy balances between avoiding frequent reallocations and wasting memory.
-     * @note Invalidates all iterators and pointers.
+     * @note For `emplace_back`, use `emplace_back_realloc` instead, which constructs the
+     *       new element *before* releasing the old buffer to guard against self-insertion.
      *
-     * @see reserve(size_type) for requesting specific capacity
+     * @see reserve(size_type) for requesting a specific capacity
+     * @see emplace_back_realloc for the self-insertion-safe growth path
      */
     constexpr auto reallocate() -> void
     {
-        // Calculate new capacity: 1.5x growth or start at 1
-        // We use size_type to avoid floating point math where possible
-        size_type new_capacity = (capacity_ == 0) ? 1 : capacity_ + capacity_ / 2;
+        reserve(compute_next_capacity());
+    }
 
-        // 2x growth factor for testing
-        // size_type new_capacity = (capacity_ == 0) ? 1 : capacity_ * 2;
+    /**
+     * @brief Self-insertion-safe reallocation helper for emplace_back
+     *
+     * Called by `emplace_back` when the vector is at capacity. Unlike `reallocate()` followed
+     * by `traits::construct(...)`, this helper constructs the new element into the freshly
+     * allocated buffer *before* the old buffer is released, ensuring that arguments which alias
+     * elements of the current container (e.g. `vec.emplace_back(vec[0])`) remain valid during
+     * construction.
+     *
+     * The sequence is:
+     *  1. Compute new capacity and allocate a fresh buffer.
+     *  2. Construct the new element at position `size_` in the new buffer (old buffer still live).
+     *  3. Relocate existing elements `[0, size_)` to the new buffer.
+     *  4. Destroy old elements (non-trivial types) and release the old buffer.
+     *  5. Update `data_`, `capacity_`, and `size_`.
+     *
+     * @tparam Args Types of arguments to forward to T's constructor.
+     * @param args Arguments to forward. May safely alias elements of the current buffer.
+     * @return A reference to the newly constructed element.
+     *
+     * @complexity \f$ O(\mbox{size}) \f$
+     *
+     * @exception std::length_error if the computed capacity exceeds max_size()
+     * @exception std::bad_alloc if allocation fails
+     * @exception ... Any exception thrown by T's constructor or by T's move/copy constructor
+     *              during relocation
+     *
+     * @exception_safety Strong: on any exception the vector is left unchanged and all
+     *                   partially-constructed elements in the new buffer are properly destroyed.
+     *
+     * @see emplace_back for the public entry point
+     */
+    template <typename... Args>
+    constexpr auto emplace_back_realloc(Args&&... args) -> reference
+        requires std::constructible_from<T, Args...>
+    {
+        const size_type new_cap = compute_next_capacity();
+        pointer new_data = traits::allocate(alloc_, new_cap);
 
-        // Ensure that if capacity was 1, it actually grows (1 + 1/2 = 1 in integer math)
-        if (new_capacity <= capacity_)
+        // Step 1 — Construct the new element at its final position WHILE the old buffer is
+        // still live. This is what makes self-insertion (e.g. vec.emplace_back(vec[0])) safe:
+        // `args` are still valid pointers/references into the old allocation.
+        try
         {
-            new_capacity = capacity_ + 1;
+            traits::construct(alloc_, new_data + size_, std::forward<Args>(args)...);
+        }
+        catch (...)
+        {
+            traits::deallocate(alloc_, new_data, new_cap);
+            throw;
         }
 
-        reserve(new_capacity);
+        // Step 2 — Relocate existing elements [0, size_) into the new buffer.
+        try
+        {
+            relocate_elements(new_data);
+        }
+        catch (...)
+        {
+            // Must destroy the already-constructed new element before freeing the new buffer.
+            traits::destroy(alloc_, new_data + size_);
+            traits::deallocate(alloc_, new_data, new_cap);
+            throw;
+        }
+
+        // Step 3 — Release the old buffer. For non-trivial types, `relocate_elements` used
+        // move/copy construction, so the old objects must be explicitly destroyed first.
+        if constexpr (!detail::trivially_manipulable_v<value_type, Alloc>)
+        {
+            for (size_type j = 0; j < size_; ++j)
+                traits::destroy(alloc_, data_ + j);
+        }
+        if (data_)
+            traits::deallocate(alloc_, data_, capacity_);
+
+        data_ = new_data;
+        capacity_ = new_cap;
+        return data_[size_++];
+    }
+
+    /**
+     * @brief Fills `count` elements at `dst` by copy-constructing from `value`
+     *
+     * Constructs `count` copies of `value` into the uninitialized storage at `dst`. Uses a fast
+     * path (memset for 1-byte trivial types, std::fill_n for larger trivial types) when the type
+     * and allocator permit, and falls back to `traits::construct` with strong exception safety
+     * for non-trivial types.
+     *
+     * @param dst   Pointer to the first byte of uninitialized storage. Must have room for at
+     *              least `count` elements of type T.
+     * @param count Number of elements to construct.
+     * @param value Source value to copy from. Must remain valid for the entire call.
+     *
+     * @complexity \f$ O(\mbox{count}) \f$
+     *
+     * @exception ... Any exception thrown by T's copy constructor.
+     *
+     * @exception_safety Strong: if any construction fails, all previously constructed elements
+     *                   in `[dst, dst+i)` are destroyed before the exception is re-thrown.
+     *
+     * @note For trivially copyable single-byte types the entire fill is reduced to a single
+     *       `std::memset` call outside constant evaluation contexts.
+     */
+    constexpr auto construct_fill(pointer dst, size_type count, const_reference value) -> void
+    {
+        if constexpr (detail::trivially_manipulable_v<value_type, Alloc>)
+        {
+            if !consteval
+            {
+                if constexpr (sizeof(value_type) == 1)
+                    std::memset(dst, static_cast<unsigned char>(value), count);
+                else
+                    std::fill_n(dst, count, value);
+                return;
+            }
+        }
+
+        size_type i = 0;
+        try
+        {
+            for (; i < count; ++i)
+                traits::construct(alloc_, dst + i, value);
+        }
+        catch (...)
+        {
+            while (i > 0)
+                traits::destroy(alloc_, dst + (--i));
+            throw;
+        }
+    }
+
+    /**
+     * @brief Default-constructs `count` elements into the uninitialized storage at `dst`
+     *
+     * Constructs `count` elements into `[dst, dst + count)` using `traits::construct(alloc_, p)`
+     * (value-initialization). For trivially default-constructible types with a standard allocator,
+     * construction is skipped entirely outside of constant-evaluation contexts (the memory is left
+     * with indeterminate values) — matching the `resize(count)` performance contract documented in
+     * the class header.
+     *
+     * @param dst   Pointer to the first byte of uninitialized storage. Must have room for at
+     *              least `count` elements of type T.
+     * @param count Number of elements to default-construct.
+     *
+     * @complexity \f$ O(\mbox{count}) \f$ for non-trivial types; \f$ O(1) \f$ for trivially
+     *             default-constructible types outside constant evaluation.
+     *
+     * @exception ... Any exception thrown by T's default constructor.
+     *
+     * @exception_safety Strong: if any construction fails, all previously constructed elements
+     *                   in `[dst, dst+i)` are destroyed before the exception is re-thrown.
+     *
+     * @warning For trivially default-constructible types at runtime, newly created elements will
+     *          contain indeterminate values. This is intentional for performance. If you need
+     *          zero-initialization, use `construct_fill(dst, count, T{})` instead.
+     */
+    constexpr void construct_fill_default(size_type count)
+    {
+        if constexpr (detail::trivially_value_initializable_v<T, Alloc>)
+        {
+            if !consteval
+            {
+                // For trivially default-constructible types at runtime, skip construction
+                // for performance (elements will contain indeterminate values).
+                return;
+            }
+        }
+
+        size_type i = 0;
+        try
+        {
+            for (; i < count; ++i)
+                traits::construct(alloc_, data_ + i);
+        }
+        catch (...)
+        {
+            while (i > 0)
+                traits::destroy(alloc_, data_ + (--i));
+            throw;
+        }
+    }
+
+    /**
+     * @brief Copy-constructs `n` elements from the range `[first, first+n)` into `dst`
+     *
+     * Constructs `n` copies of the elements in the range `[first, first+n)` into the
+     * uninitialized storage at `dst`. Uses a fast memcpy path for trivially copyable types
+     * accessed via contiguous iterators, and falls back to `traits::construct` with strong
+     * exception safety otherwise.
+     *
+     * @tparam InputIt Any iterator type. The memcpy fast path requires
+     *                 `std::contiguous_iterator<InputIt>` in addition to trivial copyability.
+     * @param dst   Pointer to the first byte of uninitialized destination storage.
+     * @param first Iterator to the first source element.
+     * @param n     Number of elements to copy-construct.
+     *
+     * @complexity \f$ O(n) \f$; effectively \f$ O(1) \f$ for trivially copyable types via memcpy.
+     *
+     * @exception ... Any exception thrown by T's copy constructor.
+     *
+     * @exception_safety Strong: if any construction fails, all previously constructed elements
+     *                   in `[dst, dst+i)` are destroyed before the exception is re-thrown.
+     */
+    template <typename InputIt>
+    constexpr void copy_construct_range(pointer dst, InputIt first, size_type n)
+    {
+        if constexpr (detail::trivially_manipulable_v<value_type, Alloc> &&
+                      std::contiguous_iterator<InputIt>)
+        {
+            if !consteval
+            {
+                if (n > 0)
+                    std::memcpy(static_cast<void*>(dst),
+                                static_cast<const void*>(std::to_address(first)),
+                                n * sizeof(value_type));
+                return;
+            }
+        }
+
+        size_type i = 0;
+        try
+        {
+            for (; i < n; ++i, ++first)
+                traits::construct(alloc_, dst + i, *first);
+        }
+        catch (...)
+        {
+            while (i > 0)
+                traits::destroy(alloc_, dst + (--i));
+            throw;
+        }
+    }
+
+    /**
+     * @brief Relocates all `size_` existing elements into a new, already-allocated buffer
+     *
+     * Constructs elements at `[dst, dst+size_)` by moving (via `std::move_if_noexcept`) or
+     * copying from the current buffer `data_`. For trivially copyable types, falls back to
+     * a single memcpy. Does NOT free the old buffer or update any member variables.
+     *
+     * @param dst Pointer to the start of an already-allocated destination buffer. Must have
+     *            room for at least `size_` elements. Must not overlap with `data_`.
+     *
+     * @complexity \f$ O(\mbox{size}) \f$; effectively \f$ O(1) \f$ for trivially copyable types.
+     *
+     * @exception ... Any exception thrown by T's move/copy constructor.
+     *
+     * @exception_safety Strong: if any construction fails, all partially-constructed elements
+     *                   at `[dst, dst+i)` are destroyed before the exception is re-thrown.
+     *                   The source buffer `data_` is left intact.
+     *
+     * @note Callers are responsible for destroying the source elements and deallocating the
+     *       source buffer after this call succeeds.
+     *
+     * @see reserve(size_type) for the primary user of this helper
+     * @see emplace_back_realloc for the emplace_back-specific reallocation path
+     */
+    constexpr auto relocate_elements(pointer dst) -> void
+    {
+        if constexpr (detail::trivially_manipulable_v<value_type, Alloc>)
+        {
+            if !consteval
+            {
+                if (size_ > 0)
+                    std::memcpy(static_cast<void*>(dst), static_cast<const void*>(data_),
+                                size_ * sizeof(value_type));
+                return;
+            }
+        }
+
+        size_type i = 0;
+        try
+        {
+            for (; i < size_; ++i)
+                traits::construct(alloc_, dst + i, std::move_if_noexcept(data_[i]));
+        }
+        catch (...)
+        {
+            while (i > 0)
+                traits::destroy(alloc_, dst + (--i));
+            throw;
+        }
+    }
+
+    /**
+     * @brief Destroys elements from the end until `size_` equals `new_size`
+     *
+     * For non-trivially-destructible types, calls `traits::destroy` on elements from index
+     * `size_-1` down to `new_size`, decrementing `size_` as it goes so the vector stays
+     * in a consistent state even if a destructor throws. For trivially destructible types,
+     * simply sets `size_ = new_size` in O(1) without any destructor calls.
+     *
+     * @param new_size The target size. Must satisfy `new_size <= size_`.
+     *
+     * @complexity \f$ O(\mbox{size} - \mbox{new_size}) \f$ for non-trivial types;
+     *             \f$ O(1) \f$ for trivially destructible types.
+     *
+     * @exception noexcept
+     *
+     * @see clear() which calls truncate_to(0)
+     * @see resize(size_type) which calls truncate_to(new_size) when shrinking
+     */
+    constexpr void truncate_to(size_type new_size)
+    {
+        if constexpr (!detail::trivially_destructible_v<T, Alloc>)
+        {
+            while (size_ > new_size)
+            {
+                --size_;
+                traits::destroy(alloc_, data_ + size_);
+            }
+        }
+        else
+        {
+            size_ = new_size;
+        }
+    }
+
+    /**
+     * @brief Core insertion primitive: shifts a tail, fills a gap, and maintains strong safety
+     *
+     * All single- and multi-element insertion operations (insert, emplace) delegate here.
+     * The function handles two major scenarios:
+     *
+     *  **Reallocation path** (`size_ + count > capacity_`): A temporary vector is built with
+     *  enough capacity, the prefix `[0, index)` is pushed in, `append_n` is called to push
+     *  the new elements, then the suffix `[index, size_)` is appended. The temporary is then
+     *  swapped in atomically. This path provides the strong guarantee unconditionally.
+     *
+     *  **In-place path** (`size_ + count <= capacity_`): Two sub-cases:
+     *   - *Trivially manipulable T*: `std::copy_backward` shifts the tail, then `fill_gap`
+     *     fills the vacated positions. Cannot throw; size is updated atomically.
+     *   - *Non-trivial T*: Elements in the tail are move-constructed one at a time into the
+     *     newly-extended region, and then `fill_gap` constructs the new elements into the gap.
+     *     A careful catch block restores the original layout if either phase throws.
+     *
+     * @tparam FillGapFn Callable with signature `void(pointer dst)`. Constructs exactly `count`
+     *                   elements starting at `dst`.
+     * @tparam AppendFn  Callable with signature `void(vector& temp)`. Appends exactly `count`
+     *                   new elements to `temp` via `emplace_back`.
+     *
+     * @param pos      Position before which elements are inserted. Must be in `[cbegin(), cend()]`.
+     * @param count    Number of elements to insert.
+     * @param fill_gap Fills the gap left by the tail shift for the in-place path.
+     * @param append_n Fills the new elements for the reallocation path.
+     *
+     * @return An iterator to the first newly inserted element.
+     *
+     * @complexity \f$ O(\mbox{size} + \mbox{count}) \f$
+     *
+     * @exception std::length_error if size() + count exceeds max_size()
+     * @exception std::bad_alloc if reallocation fails
+     * @exception ... Any exception thrown by T's constructor or move constructor
+     *
+     * @exception_safety Strong on the reallocation path. Strong on the trivial in-place path.
+     *                   Strong on the non-trivial in-place path if the shift loop fails;
+     *                   strong if the fill_gap phase fails after a complete shift. Basic only
+     *                   if fill_gap itself throws after a partial shift of a throwing-move T.
+     *
+     * @note `fill_gap` and `append_n` must insert exactly `count` elements. Inserting more or
+     *       fewer produces undefined behavior.
+     * @note For the in-place non-trivial path, `fill_gap` must not read from elements at or
+     *       after the insertion point (they have been moved away).
+     */
+    template <typename FillGapFn, typename AppendFn>
+    constexpr auto insert_n(const_iterator pos, size_type count, FillGapFn&& fill_gap,
+                            AppendFn&& append_n) -> iterator
+    {
+        size_type index = pos - cbegin();
+
+        if (count == 0)
+            return iterator(data_ + index);
+
+        if (size_ + count > max_size()) [[unlikely]]
+            throw std::length_error("forge::vector::insert: size exceeds max_size()");
+
+        if (size_ + count > capacity_)
+        {
+            size_type new_capacity = std::max(size_ + count, capacity_ + capacity_ / 2);
+            vector temp(alloc_);
+            temp.reserve(new_capacity);
+
+            for (size_type i = 0; i < index; ++i)
+                temp.push_back(std::move_if_noexcept(data_[i]));
+
+            append_n(temp);
+
+            for (size_type i = index; i < size_; ++i)
+                temp.push_back(std::move_if_noexcept(data_[i]));
+
+            this->swap(temp);
+            return iterator(data_ + index);
+        }
+
+        // In-place: no reallocation needed.
+        if constexpr (detail::trivially_manipulable_v<T, Alloc>)
+        {
+            if !consteval
+            {
+                std::copy_backward(data_ + index, data_ + size_, data_ + size_ + count);
+                fill_gap(data_ + index); // bulk fast path inside; cannot throw here
+                size_ += count;
+                return iterator(data_ + index);
+            }
+        }
+
+        size_type elements_moved = 0;
+        try
+        {
+            for (size_type i = size_; i > index; --i)
+            {
+                traits::construct(alloc_, data_ + i + count - 1,
+                                  std::move_if_noexcept(data_[i - 1]));
+                ++elements_moved;
+                traits::destroy(alloc_, data_ + i - 1);
+            }
+
+            fill_gap(data_ + index);
+        }
+        catch (...)
+        {
+            // restore_base, not `index`: the elements_moved already-shifted elements
+            // are the topmost elements_moved of the original tail, so they belong
+            // back at [size_ - elements_moved, ...) — this is only equal to `index`
+            // when elements_moved is the *full* shift count (i.e. the shift loop
+            // succeeded and fill_gap failed). Using `index` unconditionally here
+            // (as in the original implementation) silently corrupts memory when the
+            // shift loop itself fails partway through.
+            size_type restore_base = size_ - elements_moved;
+            for (size_type j = 0; j < elements_moved; ++j)
+            {
+                traits::construct(alloc_, data_ + restore_base + j,
+                                  std::move_if_noexcept(data_[restore_base + count + j]));
+                traits::destroy(alloc_, data_ + restore_base + count + j);
+            }
+            throw;
+        }
+
+        size_ += count;
+        return iterator(data_ + index);
     }
 
   private:

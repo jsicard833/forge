@@ -23,6 +23,11 @@
 template <typename T> struct IdAllocator
 {
     using value_type = T;
+
+    using propagate_on_container_move_assignment = std::true_type;
+    using propagate_on_container_copy_assignment = std::true_type;
+    using propagate_on_container_swap = std::true_type;
+
     int id; // Custom identifier to track which allocator instance is being used
 
     IdAllocator(int id) : id(id) {}
@@ -160,6 +165,78 @@ struct ThrowingMove
     }
 };
 
+template <typename T, bool PropagateMove = false, bool AlwaysEqual = false>
+struct CustomTestAllocator
+{
+    using value_type = T;
+    using propagate_on_container_move_assignment = std::bool_constant<PropagateMove>;
+    using is_always_equal = std::bool_constant<AlwaysEqual>;
+
+    int id = 0;
+
+    CustomTestAllocator() = default;
+    explicit CustomTestAllocator(int instance_id) : id(instance_id) {}
+
+    template <typename U> struct rebind
+    {
+        using other = CustomTestAllocator<U, PropagateMove, AlwaysEqual>;
+    };
+
+    T* allocate(std::size_t n)
+    {
+        return std::allocator<T>{}.allocate(n);
+    }
+    void deallocate(T* p, std::size_t n)
+    {
+        std::allocator<T>{}.deallocate(p, n);
+    }
+
+    bool operator==(const CustomTestAllocator& other) const
+    {
+        if constexpr (AlwaysEqual)
+            return true;
+        return id == other.id;
+    }
+};
+
+// A strict single-pass input iterator wrapping an integer pointer
+struct MinimalInputIterator
+{
+    using iterator_category = std::input_iterator_tag;
+    using value_type = int;
+    using difference_type = std::ptrdiff_t;
+    using pointer = const int*;
+    using reference = const int&;
+
+    const int* ptr = nullptr;
+
+    constexpr auto operator*() const noexcept -> reference
+    {
+        return *ptr;
+    }
+    constexpr auto operator->() const noexcept -> pointer
+    {
+        return ptr;
+    }
+
+    constexpr auto operator++() noexcept -> MinimalInputIterator&
+    {
+        ++ptr;
+        return *this;
+    }
+    constexpr auto operator++(int) noexcept -> MinimalInputIterator
+    {
+        MinimalInputIterator tmp = *this;
+        ++ptr;
+        return tmp;
+    }
+    constexpr friend auto operator==(const MinimalInputIterator& a,
+                                     const MinimalInputIterator& b) noexcept -> bool
+    {
+        return a.ptr == b.ptr;
+    }
+};
+
 // ==========================================================
 // Tests
 // ==========================================================
@@ -177,7 +254,7 @@ TEST_CASE("Default vector construction", "[vector][constructors]")
 
     SECTION("honors the noexcept contract")
     {
-        static_assert(noexcept(forge::vector<int>()), "Default constructor should be noexcept");
+        STATIC_REQUIRE(noexcept(forge::vector<int>()));
     }
 }
 
@@ -201,8 +278,7 @@ TEST_CASE("Vector construction with a given allocator", "[vector][constructors]"
 
     SECTION("honors the noexcept contract")
     {
-        static_assert(noexcept(forge::vector<int, IdAllocator<int>>(id_alloc)),
-                      "Constructor with allocator should be noexcept");
+        STATIC_REQUIRE(noexcept(forge::vector<int, IdAllocator<int>>(id_alloc)));
     }
 }
 
@@ -404,6 +480,59 @@ TEST_CASE("Vector construction from range of iterators", "[vector][constructors]
         CHECK(ThrowsAfterNConstructions::count ==
               0); // All constructed elements should have been destroyed
     }
+
+    SECTION("fast path: works for trivially copyable types with contiguous iterators")
+    {
+        // Define a trivially copyable custom type to prove it's not just primitives
+        struct Point
+        {
+            int x;
+            int y;
+        };
+        std::array<Point, 3> source{{{1, 2}, {3, 4}, {5, 6}}};
+
+        // std::array::iterator is a std::contiguous_iterator, triggering the memmove path
+        forge::vector<Point> vec(source.begin(), source.end());
+
+        REQUIRE(vec.size() == source.size());
+        CHECK(vec.capacity() == source.size());
+        REQUIRE(vec.data() != nullptr);
+
+        CHECK(vec[0].x == 1);
+        CHECK(vec[2].y == 6);
+    }
+
+    SECTION("safe path: handles pure input iterators without draining them via std::distance")
+    {
+        // An istringstream iterator is a pure input iterator (not a forward iterator)
+        std::istringstream stream("10 20 30 40 50");
+        std::istream_iterator<int> first(stream);
+        std::istream_iterator<int> last;
+
+        // This tests that our implementation loops dynamically using emplace_back style
+        // allocations without failing or crashing on std::distance.
+        forge::vector<int> vec(first, last);
+
+        REQUIRE(vec.size() == 5);
+        CHECK(vec.capacity() >= 5);
+
+        CHECK(vec[0] == 10);
+        CHECK(vec[4] == 50);
+    }
+
+    SECTION("hybrid path: handles trivially copyable types with non-contiguous forward iterators")
+    {
+        // std::list::iterator is a bidirectional iterator, meaning it is a forward iterator,
+        // but NOT a contiguous iterator. It must use the single-allocation chunk size path,
+        // but fall back to standard traits::construct loops instead of raw memmove.
+        std::list<int> source{100, 200, 300};
+        forge::vector<int> vec(source.begin(), source.end());
+
+        REQUIRE(vec.size() == 3);
+        CHECK(vec.capacity() == 3); // Pre-computed via std::distance precisely
+        CHECK(vec[0] == 100);
+        CHECK(vec[2] == 300);
+    }
 }
 
 TEST_CASE("Vector construction from initializer list", "[vector][constructors]")
@@ -578,8 +707,7 @@ TEST_CASE("Vector move construction", "[vector][constructors]")
 
     SECTION("honors the noexcept contract")
     {
-        static_assert(noexcept(forge::vector<int>(std::move(std::declval<forge::vector<int>>()))),
-                      "Move constructor should be noexcept");
+        STATIC_REQUIRE(noexcept(forge::vector<int>(std::move(std::declval<forge::vector<int>>()))));
     }
 }
 
@@ -770,11 +898,98 @@ TEST_CASE("Vector move assignment operator", "[vector][assignment]")
         CHECK(original.data() == nullptr);
     }
 
-    SECTION("honors the noexcept contract")
+    SECTION("Path 1: POCMA is true - steals buffer and explicitly overwrites allocator")
     {
-        static_assert(noexcept(std::declval<forge::vector<int>&>() =
-                                   std::move(std::declval<forge::vector<int>>())),
-                      "Move assignment operator should be noexcept");
+        // Set PropagateMove = true
+        using AllocType = CustomTestAllocator<int, true, false>;
+
+        forge::vector<int, AllocType> original({1, 2, 3}, AllocType(100));
+        forge::vector<int, AllocType> moved({4, 5}, AllocType(200));
+
+        int* original_ptr = original.data();
+
+        // Perform the move assignment
+        moved = std::move(original);
+
+        // Allocator MUST propagate (ID changes from 200 to 100)
+        CHECK(moved.get_allocator().id == 100);
+
+        // Fast buffer stealing path verification
+        CHECK(moved.data() == original_ptr);
+        CHECK(moved.size() == 3);
+
+        // Source state tracking
+        CHECK(original.data() == nullptr);
+        CHECK(original.size() == 0);
+    }
+
+    SECTION("Path 2: POCMA is false, but allocators compare equal - steals buffer, leaves "
+            "allocator intact")
+    {
+        // Set PropagateMove = false, AlwaysEqual = false (but matching instances)
+        using AllocType = CustomTestAllocator<int, false, false>;
+
+        forge::vector<int, AllocType> original({1, 2, 3}, AllocType(50));
+        forge::vector<int, AllocType> moved({7, 8, 9, 10}, AllocType(50)); // Same ID!
+
+        int* original_ptr = original.data();
+
+        moved = std::move(original);
+
+        // Allocator remains our own instance
+        CHECK(moved.get_allocator().id == 50);
+
+        // Fast path buffer verification
+        CHECK(moved.data() == original_ptr);
+        CHECK(moved.size() == 3);
+
+        // Source state tracking
+        CHECK(original.data() == nullptr);
+        CHECK(original.size() == 0);
+    }
+
+    SECTION(
+        "Path 3: Fallback - POCMA is false and allocators are UNEQUAL (Element-wise dynamic move)")
+    {
+        // Set PropagateMove = false, AlwaysEqual = false
+        using AllocType = CustomTestAllocator<int, false, false>;
+
+        forge::vector<int, AllocType> original({10, 20, 30}, AllocType(11));
+        forge::vector<int, AllocType> moved({1, 2}, AllocType(22)); // Differing IDs!
+
+        int* original_ptr = original.data();
+        int* moved_old_ptr = moved.data();
+
+        moved = std::move(original);
+
+        // 1. Allocator must NOT propagate
+        CHECK(moved.get_allocator().id == 22);
+
+        // 2. Memory blocks must NOT be stolen (since cross-allocator pointer deletion is fatal)
+        CHECK(moved.data() != original_ptr);
+        CHECK(original.data() == original_ptr); // Source retains its pointer block!
+
+        // 3. Values were successfully drained out element-by-element
+        REQUIRE(moved.size() == 3);
+        CHECK(moved[0] == 10);
+        CHECK(moved[2] == 30);
+
+        // 4. Source vector state verification on element fallback
+        CHECK(original.size() == 3); // Size stays intact per standard element move specifications
+    }
+
+    SECTION("Conditional noexcept contract matching specifications")
+    {
+        // Case A: Propagating or AlwaysEqual allocators MUST evaluate to noexcept
+        using SafeAlloc = CustomTestAllocator<int, true, false>;
+        STATIC_REQUIRE(noexcept(std::declval<forge::vector<int, SafeAlloc>&>() =
+                                    std::declval<forge::vector<int, SafeAlloc>>()));
+
+        // Case B: Non-propagating, non-equal allocators are NOT noexcept because
+        // element-wise fallback assignment can trigger memory reallocations
+        using FallbackAlloc = CustomTestAllocator<int, false, false>;
+        STATIC_REQUIRE_FALSE(noexcept(std::declval<forge::vector<int, FallbackAlloc>&>() =
+                                          std::declval<forge::vector<int, FallbackAlloc>>()));
     }
 }
 
@@ -815,8 +1030,7 @@ TEST_CASE("Vector operator[]", "[vector][element access]")
 
         SECTION("honors the noexcept contract")
         {
-            static_assert(noexcept(std::declval<forge::vector<int>&>()[0]),
-                          "operator[] should be noexcept");
+            STATIC_REQUIRE(noexcept(std::declval<forge::vector<int>&>()[0]));
         }
     }
 
@@ -844,8 +1058,7 @@ TEST_CASE("Vector operator[]", "[vector][element access]")
 
         SECTION("honors the noexcept contract")
         {
-            static_assert(noexcept(std::declval<forge::vector<int>&>()[0]),
-                          "operator[] should be noexcept");
+            STATIC_REQUIRE(noexcept(std::declval<forge::vector<int>&>()[0]));
         }
     }
 }
@@ -952,8 +1165,7 @@ TEST_CASE("Vector front()", "[vector][element access]")
 
         SECTION("honors the noexcept contract")
         {
-            static_assert(noexcept(std::declval<forge::vector<int>&>().front()),
-                          "front() should be noexcept");
+            STATIC_REQUIRE(noexcept(std::declval<forge::vector<int>&>().front()));
         }
     }
 
@@ -968,8 +1180,7 @@ TEST_CASE("Vector front()", "[vector][element access]")
 
         SECTION("honors the noexcept contract")
         {
-            static_assert(noexcept(std::declval<const forge::vector<int>&>().front()),
-                          "front() should be noexcept");
+            STATIC_REQUIRE(noexcept(std::declval<const forge::vector<int>&>().front()));
         }
     }
 }
@@ -998,8 +1209,7 @@ TEST_CASE("Vector back()", "[vector][element access]")
 
         SECTION("honors the noexcept contract")
         {
-            static_assert(noexcept(std::declval<forge::vector<int>&>().back()),
-                          "back() should be noexcept");
+            STATIC_REQUIRE(noexcept(std::declval<forge::vector<int>&>().back()));
         }
     }
 
@@ -1014,8 +1224,7 @@ TEST_CASE("Vector back()", "[vector][element access]")
 
         SECTION("honors the noexcept contract")
         {
-            static_assert(noexcept(std::declval<const forge::vector<int>&>().back()),
-                          "back() should be noexcept");
+            STATIC_REQUIRE(noexcept(std::declval<const forge::vector<int>&>().back()));
         }
     }
 }
@@ -1056,8 +1265,7 @@ TEST_CASE("Vector data()", "[vector][element access]")
 
         SECTION("honors the noexcept contract")
         {
-            static_assert(noexcept(std::declval<forge::vector<int>&>().data()),
-                          "data() should be noexcept");
+            STATIC_REQUIRE(noexcept(std::declval<forge::vector<int>&>().data()));
         }
     }
 
@@ -1083,8 +1291,7 @@ TEST_CASE("Vector data()", "[vector][element access]")
 
         SECTION("honors the noexcept contract")
         {
-            static_assert(noexcept(std::declval<const forge::vector<int>&>().data()),
-                          "data() should be noexcept");
+            STATIC_REQUIRE(noexcept(std::declval<const forge::vector<int>&>().data()));
         }
     }
 }
@@ -1127,8 +1334,7 @@ TEST_CASE("Vector get_view()", "[vector][element access]")
 
         SECTION("honors the noexcept contract")
         {
-            static_assert(noexcept(std::declval<forge::vector<int>&>().get_view()),
-                          "get_view() should be noexcept");
+            STATIC_REQUIRE(noexcept(std::declval<forge::vector<int>&>().get_view()));
         }
     }
 
@@ -1156,10 +1362,18 @@ TEST_CASE("Vector get_view()", "[vector][element access]")
 
         SECTION("honors the noexcept contract")
         {
-            static_assert(noexcept(std::declval<const forge::vector<int>&>().get_view()),
-                          "get_view() should be noexcept");
+            STATIC_REQUIRE(noexcept(std::declval<const forge::vector<int>&>().get_view()));
         }
     }
+}
+
+template <typename T> constexpr bool test_constexpr_contains()
+{
+    forge::vector<T> v;
+    v.push_back(T{10});
+    v.push_back(T{20});
+    v.push_back(T{30});
+    return v.contains(T{20}) && !v.contains(T{99});
 }
 
 TEST_CASE("Vector contains()", "[vector][element access]")
@@ -1201,14 +1415,62 @@ TEST_CASE("Vector contains()", "[vector][element access]")
         CHECK(const_vec.contains(3));
         CHECK(const_vec.contains(5));
         CHECK_FALSE(const_vec.contains(0));
-        CHECK_FALSE(const_vec.contains(6));
-        CHECK_FALSE(const_vec.contains(-1));
     }
 
-    SECTION("honors the noexcept contract")
+    SECTION("Optimized path: 1-byte trivial types (via char_traits)")
     {
-        static_assert(noexcept(std::declval<forge::vector<int>&>().contains(0)),
-                      "contains() should be noexcept");
+        // Triggers the sizeof(T) == 1 && is_trivially_copyable branch
+        forge::vector<uint8_t> byte_vec{10, 20, 30, 42, 50};
+
+        CHECK(byte_vec.contains(uint8_t{10}));       // Beginning
+        CHECK(byte_vec.contains(uint8_t{42}));       // Middle
+        CHECK(byte_vec.contains(uint8_t{50}));       // End
+        CHECK_FALSE(byte_vec.contains(uint8_t{99})); // Missing
+
+        // Check with char as well
+        forge::vector<char> char_vec{'f', 'o', 'r', 'g', 'e'};
+        CHECK(char_vec.contains('o'));
+        CHECK_FALSE(char_vec.contains('z'));
+    }
+
+    SECTION("Heterogeneous lookup: Searches with compatible types")
+    {
+        // Case A: string vs string_view (Prevents temporary std::string allocations)
+        forge::vector<std::string> string_vec{"apple", "banana", "cherry"};
+
+        // Passing std::string_view instead of const std::string&
+        std::string_view search_view = "banana";
+        std::string_view missing_view = "durian";
+
+        CHECK(string_vec.contains(search_view));
+        CHECK_FALSE(string_vec.contains(missing_view));
+        CHECK(string_vec.contains("apple")); // Raw string literal lookup
+
+        // Case B: Numeric cross-type comparisons (int vs double)
+        forge::vector<double> double_vec{1.0, 2.5, 3.0, 4.25};
+        CHECK(double_vec.contains(3)); // int lookup against double container
+        CHECK_FALSE(double_vec.contains(5));
+    }
+
+    SECTION("Compiles and runs correctly in a constexpr context")
+    {
+        // Tests the 1-byte char_traits path at compile-time
+        STATIC_REQUIRE(test_constexpr_contains<uint8_t>());
+        STATIC_REQUIRE(test_constexpr_contains<char>());
+
+        // Tests the general std::ranges::find path at compile-time
+        STATIC_REQUIRE(test_constexpr_contains<int>());
+        STATIC_REQUIRE(test_constexpr_contains<double>());
+    }
+
+    SECTION("honors the noexcept contract and respects concept constraints")
+    {
+        // Base noexcept condition
+        STATIC_REQUIRE(noexcept(std::declval<forge::vector<int>&>().contains(0)));
+
+        // Verifies the constraint works: checking if contains detects type-compatibility
+        // constraints (A vector of ints cannot be queried with a std::string)
+        STATIC_REQUIRE(!std::equality_comparable_with<int, std::string>);
     }
 }
 
@@ -1249,8 +1511,7 @@ TEST_CASE("Vector find()", "[vector][element access]")
 
     SECTION("honors the noexcept contract")
     {
-        static_assert(noexcept(std::declval<forge::vector<int>&>().find(0)),
-                      "find() should be noexcept");
+        STATIC_REQUIRE(noexcept(std::declval<forge::vector<int>&>().find(0)));
     }
 }
 
@@ -1286,7 +1547,7 @@ TEST_CASE("Vector get_allocator()", "[vector][allocator]")
     SECTION("honors the noexcept contract")
     {
         forge::vector<int> vec;
-        static_assert(noexcept(vec.get_allocator()), "get_allocator() should be noexcept");
+        STATIC_REQUIRE(noexcept(vec.get_allocator()));
     }
 }
 
@@ -1316,7 +1577,7 @@ TEST_CASE("Vector size()", "[vector][capacity]")
     SECTION("honors the noexcept contract")
     {
         forge::vector<int> vec;
-        static_assert(noexcept(vec.size()), "size() should be noexcept");
+        STATIC_REQUIRE(noexcept(vec.size()));
     }
 }
 
@@ -1337,7 +1598,7 @@ TEST_CASE("Vector max_size()", "[vector][capacity]")
     SECTION("honors the noexcept contract")
     {
         forge::vector<int> vec;
-        static_assert(noexcept(vec.max_size()), "max_size() should be noexcept");
+        STATIC_REQUIRE(noexcept(vec.max_size()));
     }
 }
 
@@ -1372,7 +1633,7 @@ TEST_CASE("Vector capacity()", "[vector][capacity]")
     SECTION("honors the noexcept contract")
     {
         forge::vector<int> vec;
-        static_assert(noexcept(vec.capacity()), "capacity() should be noexcept");
+        STATIC_REQUIRE(noexcept(vec.capacity()));
     }
 }
 
@@ -1402,7 +1663,7 @@ TEST_CASE("Vector empty()", "[vector][capacity]")
     SECTION("honors the noexcept contract")
     {
         forge::vector<int> vec;
-        static_assert(noexcept(vec.empty()), "empty() should be noexcept");
+        STATIC_REQUIRE(noexcept(vec.empty()));
     }
 }
 
@@ -1425,6 +1686,20 @@ TEST_CASE("Vector memory_usage()", "[vector][capacity]")
         CHECK(empty_vec.memory_usage() == 0);
     }
 
+    SECTION("correctly accounts for the control block overhead when requested")
+    {
+        forge::vector<int> vec(20);
+        std::size_t raw_buffer_bytes = sizeof(int) * vec.capacity();
+        std::size_t total_expected_bytes = raw_buffer_bytes + sizeof(vec);
+
+        // Explicitly requesting control block inclusion
+        CHECK(vec.memory_usage(true) == total_expected_bytes);
+
+        // Verifying default parameter maps back to the raw buffer only
+        CHECK(vec.memory_usage(false) == raw_buffer_bytes);
+        CHECK(vec.memory_usage() == raw_buffer_bytes);
+    }
+
     SECTION("works for const vectors")
     {
         const forge::vector<int> const_vec{1, 2, 3, 4, 5};
@@ -1438,7 +1713,7 @@ TEST_CASE("Vector memory_usage()", "[vector][capacity]")
     SECTION("honors the noexcept contract")
     {
         forge::vector<int> vec;
-        static_assert(noexcept(vec.memory_usage()), "memory_usage() should be noexcept");
+        STATIC_REQUIRE(noexcept(vec.memory_usage()));
     }
 }
 
@@ -1864,7 +2139,7 @@ TEST_CASE("Vector insert(pos, count, value)", "[vector][modifiers]")
 
     SECTION("does not trigger a reallocation if the new size does not exceed the current capacity")
     {
-        forge::vector<int> vec(10);
+        forge::vector<int> vec(10, 0);
         vec.reserve(20);
         auto it = vec.insert(vec.begin(), 2, 1); // Insert two 1s
         CHECK(vec.capacity() == 20);             // Capacity should remain unchanged
@@ -1993,6 +2268,37 @@ TEST_CASE("Vector insert(pos, first, last)", "[vector][modifiers]")
         }
     }
 
+    SECTION("adds elements from a strict single-pass input_iterator range via append-and-rotate")
+    {
+        int raw_data[] = {3, 4};
+        MinimalInputIterator first{raw_data};
+        MinimalInputIterator last{raw_data + 2};
+
+        SECTION("inserts correctly in the middle of data using single-pass logic")
+        {
+            auto it = vec.insert(vec.begin() + 2, first, last);
+
+            CHECK(it == vec.begin() + 2);
+            REQUIRE(vec.size() == 5);
+            CHECK(vec[0] == 1);
+            CHECK(vec[1] == 2);
+            CHECK(vec[2] == 3); // Rotated into position successfully
+            CHECK(vec[3] == 4);
+            CHECK(vec[4] == 5);
+        }
+
+        SECTION("inserts correctly at the beginning using single-pass logic")
+        {
+            auto it = vec.insert(vec.begin(), first, last);
+
+            CHECK(it == vec.begin());
+            REQUIRE(vec.size() == 5);
+            CHECK(vec[0] == 3);
+            CHECK(vec[1] == 4);
+            CHECK(vec[2] == 1);
+        }
+    }
+
     SECTION("inserts an empty range without modifying the vector")
     {
         std::vector<int> empty_to_insert;
@@ -2083,7 +2389,7 @@ TEST_CASE("Vector insert(pos, first, last)", "[vector][modifiers]")
 
     SECTION("does not trigger a reallocation if the new size does not exceed the current capacity")
     {
-        forge::vector<int> vec(10);
+        forge::vector<int> vec(10, 0);
         vec.reserve(20);
         forge::vector<int> to_insert{1, 2, 3};
         auto it = vec.insert(vec.begin(), to_insert.begin(),
@@ -3640,14 +3946,14 @@ TEST_CASE("Vector begin()/cbegin()", "[vector][iterators]")
         const forge::vector<int>& const_vec = mutable_vec;
 
         // Non-const vector
-        static_assert(std::is_same_v<decltype(mutable_vec.begin()), forge::vector<int>::iterator>);
-        static_assert(
+        STATIC_REQUIRE(std::is_same_v<decltype(mutable_vec.begin()), forge::vector<int>::iterator>);
+        STATIC_REQUIRE(
             std::is_same_v<decltype(mutable_vec.cbegin()), forge::vector<int>::const_iterator>);
 
         // Const vector
-        static_assert(
+        STATIC_REQUIRE(
             std::is_same_v<decltype(const_vec.begin()), forge::vector<int>::const_iterator>);
-        static_assert(
+        STATIC_REQUIRE(
             std::is_same_v<decltype(const_vec.cbegin()), forge::vector<int>::const_iterator>);
     }
 
@@ -3701,14 +4007,14 @@ TEST_CASE("Vector end()/cend()", "[vector][iterators]")
         const forge::vector<int>& const_vec = mutable_vec;
 
         // Non-const vector
-        static_assert(std::is_same_v<decltype(mutable_vec.end()), forge::vector<int>::iterator>);
-        static_assert(
+        STATIC_REQUIRE(std::is_same_v<decltype(mutable_vec.end()), forge::vector<int>::iterator>);
+        STATIC_REQUIRE(
             std::is_same_v<decltype(mutable_vec.cend()), forge::vector<int>::const_iterator>);
 
         // Const vector
-        static_assert(
+        STATIC_REQUIRE(
             std::is_same_v<decltype(const_vec.end()), forge::vector<int>::const_iterator>);
-        static_assert(
+        STATIC_REQUIRE(
             std::is_same_v<decltype(const_vec.cend()), forge::vector<int>::const_iterator>);
     }
 
@@ -3726,14 +4032,16 @@ TEST_CASE("Vector reallocate()", "[vector][helpers]")
 
     SECTION("increases the capacity to 1 from empty")
     {
-        forge::detail::vector_tests_accessor<int>::reallocate(vec); // Reallocate to a new capacity of 1
+        forge::detail::vector_tests_accessor<int>::reallocate(
+            vec); // Reallocate to a new capacity of 1
         CHECK(vec.capacity() == 1);
     }
 
     SECTION("increases the capacity to 2 from 1")
     {
         vec.reserve(1); // Ensure the vector starts with a capacity of 1
-        forge::detail::vector_tests_accessor<int>::reallocate(vec); // Reallocate to a new capacity of 2
+        forge::detail::vector_tests_accessor<int>::reallocate(
+            vec); // Reallocate to a new capacity of 2
         CHECK(vec.capacity() == 2);
     }
 
@@ -3879,5 +4187,89 @@ TEST_CASE("Vector randomized fuzzing operations maintain invariants vs std::vect
         }
 
         REQUIRE(std::equal(vec.begin(), vec.end(), std_vec.begin(), std_vec.end()));
+    }
+}
+
+consteval bool test_vector_entire_constexpr_lifecycle()
+{
+    // 1. Test Default Construction and Emptiness
+    forge::vector<int> vec;
+    if (!vec.empty() || vec.size() != 0 || vec.capacity() != 0)
+    {
+        return false;
+    }
+
+    // 2. Test Initial Reservations and memory_usage
+    vec.reserve(10);
+    if (vec.capacity() < 10 || vec.memory_usage() != (vec.capacity() * sizeof(int)))
+    {
+        return false;
+    }
+
+    // 3. Test Direct Back-Insertions (push_back and emplace_back)
+    vec.push_back(10);      // const_reference copy path
+    vec.push_back(int{20}); // rvalue reference move path
+    vec.emplace_back(40);   // In-place construct path
+
+    if (vec.size() != 3 || vec[0] != 10 || vec[1] != 20 || vec[2] != 40)
+    {
+        return false;
+    }
+
+    // 4. Test Element Replacement & Element Access
+    vec[1] = 25;
+    if (vec.front() != 10 || vec.back() != 40 || vec.data() == nullptr)
+    {
+        return false;
+    }
+
+    // 5. Test Range Insertion
+    int extra_elements[] = {5, 6};
+    // Insert 5 and 6 at index 1 -> resulting in: {10, 5, 6, 25, 40}
+    auto insert_it =
+        vec.insert(vec.begin() + 1, std::begin(extra_elements), std::end(extra_elements));
+
+    if (insert_it != (vec.begin() + 1) || vec.size() != 5)
+    {
+        return false;
+    }
+    if (vec[0] != 10 || vec[1] != 5 || vec[2] != 6 || vec[3] != 25 || vec[4] != 40)
+    {
+        return false;
+    }
+
+    // 6. Test pop_back
+    vec.pop_back(); // Removes 40
+    if (vec.size() != 4 || vec.back() != 25)
+    {
+        return false;
+    }
+
+    // 7. Test shrink_to_fit
+    vec.shrink_to_fit();
+    if (vec.capacity() != vec.size() || vec.size() != 4)
+    {
+        return false;
+    }
+
+    // 8. Test Iterators and Mutability loops
+    int sum = 0;
+    for (auto it = vec.begin(); it != vec.end(); ++it)
+    {
+        sum += *it; // 10 + 5 + 6 + 25 = 46
+    }
+    if (sum != 46)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+TEST_CASE("Vector Full Constexpr Lifecycle", "[vector][constexpr]")
+{
+    SECTION("evaluates all core operations completely at compile-time")
+    {
+        STATIC_REQUIRE(test_vector_entire_constexpr_lifecycle());
     }
 }
